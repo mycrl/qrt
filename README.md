@@ -121,7 +121,3 @@ Arrival recording is the **sensor**; GoogCC is the **controller**. Probes are pa
 ## License
 
 [GNU General Public License v3.0](LICENSE) only ([SPDX: GPL-3.0-only](https://spdx.org/licenses/GPL-3.0-only.html)).
-
-You may use, modify, and distribute this software, including in commercial products, provided that derivative works you **distribute** are also licensed under GPLv3 and you provide corresponding source.
-
-Linking this crate into a closed-source binary you ship typically makes that binary a GPL derivative. If you cannot accept copyleft, do not use this crate.
