@@ -4,8 +4,6 @@
 
 It copies WebRTC’s _ideas_ (pacing, GCC/GoogCC, NACK, XOR FEC, TWCC-style arrival feedback, jitter/NetEQ) and **not** WebRTC’s _wire_ (RTP/RTCP, ICE, DTLS, SDP). One 20-byte header carries media, FEC, and feedback on a single datagram path. There is no QUIC.
 
-`0.1.0` — pipeline is being built; the packet format and public API are **not** stable. This document is about design, not how to call the crate.
-
 ## Why this instead of WebRTC
 
 libwebrtc is a full calling stack: ICE/STUN/TURN, SDP, DTLS-SRTP, RTP/RTCP (often muxed), RTX/RED line formats, browser interop, codecs and capture. That is the right tool when you must talk to Chrome or sit in a standards mesh.
