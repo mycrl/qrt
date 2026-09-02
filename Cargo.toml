@@ -1,0 +1,18 @@
+[package]
+name = "qrt"
+description = "QRT (Quick Real-time Transport) is a low-latency media transport over bare UDP."
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+
+[dependencies]
+ahash = "0.8.12"
+bytes = "1.12.1"
+parking_lot = "0.12.5"
+tokio = { version = "1.53.1", features = [
+    "net",
+    "time",
+    "sync",
+    "macros",
+    "rt",
+] }
