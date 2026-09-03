@@ -1,6 +1,6 @@
 //! Minimal real-time media transport over bare UDP (**QRT**).
 //!
-//! - [`session::Session`] — sync **sans-I/O** state machine (tracks, BWE, pacer, …).
+//! - [`session::Session`] — sync state machine (tracks, BWE, pacer, …).
 //! - [`transport::Transport`] — host-injected datagram send/recv.
 //! - [`Qrt`] — Tokio façade: I/O loop starts in [`Qrt::new`]; callbacks via
 //!   [`QrtObserver`] (`on_track`, …).

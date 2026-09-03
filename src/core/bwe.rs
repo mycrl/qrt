@@ -1,4 +1,4 @@
-//! Send-side bandwidth estimation (**sans-I/O**), simplified GoogCC / GCC.
+//! Send-side bandwidth estimation, simplified GoogCC / GCC.
 //!
 //! Turns [`crate::core::feedback::TransportPacketsFeedback`] into a
 //! [`RateUpdate`] for the encoder and [`crate::core::pacer`]. This is the congestion
@@ -97,7 +97,6 @@
 //!
 //! - Feedback must be keyed on **transport_seq** (see [`crate::core::feedback`]);
 //!   using `media_seq` hides RTX/FEC from BWE and overestimates capacity.
-//! - This module never opens sockets or sleeps; the host supplies [`Instant`].
 //! - LossBasedBweV2 is intentionally deferred; replace the legacy loss block
 //!   later without changing the public [`RateUpdate`] shape.
 //! - See `docs/webrtc-reference.md` §2–§4 for the WebRTC mapping.
@@ -296,7 +295,7 @@ pub enum NetworkState {
     Normal,
 }
 
-/// Send-side GoogCC-style bandwidth estimator (**sans-I/O**).
+/// Send-side GoogCC-style bandwidth estimator.
 ///
 /// Own one instance per sending connection. Feed it
 /// [`crate::core::feedback::TransportPacketsFeedback`] from
@@ -351,6 +350,7 @@ impl BandwidthEstimator {
         let start = config
             .start_bitrate_bps
             .clamp(config.min_bitrate_bps, config.max_bitrate_bps);
+
         Self {
             aimd: AimdRateControl::new(start, config.min_bitrate_bps, config.max_bitrate_bps),
             trendline: TrendlineEstimator::new(config.trendline_window, config.trendline_threshold),
@@ -399,10 +399,13 @@ impl BandwidthEstimator {
         self.target_bps = self
             .target_bps
             .clamp(config.min_bitrate_bps, config.max_bitrate_bps);
+
         self.aimd
             .set_bounds(config.min_bitrate_bps, config.max_bitrate_bps);
+
         self.probe
             .set_bounds(config.min_bitrate_bps, config.max_bitrate_bps);
+
         self.config = config;
     }
 
@@ -496,10 +499,12 @@ impl BandwidthEstimator {
             (s, r) if (r as f64) < 0.9 * (s as f64) => ((r as f64) * 0.95) as u64,
             (s, r) => s.min(r),
         };
+
         let estimate = estimate.clamp(self.config.min_bitrate_bps, self.config.max_bitrate_bps);
         self.target_bps = estimate.max(self.target_bps);
         self.aimd.set_estimate(self.target_bps);
         self.acked_bps = self.acked_bps.max(self.target_bps as f64);
+
         Some(self.make_update(Vec::new()))
     }
 
@@ -528,11 +533,14 @@ impl BandwidthEstimator {
     /// ```
     pub fn poll_probes(&mut self, now: Instant, in_alr: bool) -> Vec<ProbeCluster> {
         let mut out = Vec::new();
+
         if self.startup_probes_pending {
             out.extend(self.probe.startup_clusters(self.config.start_bitrate_bps));
             self.startup_probes_pending = false;
         }
+
         out.extend(self.probe.maybe_alr_probe(now, in_alr, self.target_bps));
+
         out
     }
 
@@ -550,6 +558,7 @@ impl BandwidthEstimator {
         let pacing = ((self.target_bps as f64) * self.config.pacing_factor)
             .round()
             .max(self.target_bps as f64) as u64;
+
         RateUpdate {
             target_bitrate_bps: self.target_bps,
             pacing_rate_bps: pacing.min(self.config.max_bitrate_bps.saturating_mul(2)),
@@ -588,6 +597,7 @@ impl BandwidthEstimator {
             let dt = b
                 .saturating_duration_since(a)
                 .max(Duration::from_millis(100));
+
             let sample_bps = (acked_bytes as f64) * 8.0 * 1000.0 / (dt.as_millis() as f64);
             if sample_bps.is_finite() && sample_bps > 0.0 {
                 self.acked_bps = 0.85 * self.acked_bps + 0.15 * sample_bps;
@@ -616,6 +626,7 @@ impl BandwidthEstimator {
                     .last_increase
                     .map(|t| now.saturating_duration_since(t))
                     .unwrap_or(Duration::from_secs(1));
+
                 // Pace increases (~200ms) so a burst of Normal samples cannot
                 // multiplicative-ramp in one feedback.
                 if since >= Duration::from_millis(200) {
@@ -632,16 +643,19 @@ impl BandwidthEstimator {
             // Low loss: AIMD increase path already grows the rate.
             return;
         }
+
         if loss <= 0.10 {
             // Mid loss: hold (WebRTC legacy SendSideBandwidthEstimation).
             return;
         }
+
         // High loss: decrease every 300ms + RTT.
         let interval = Duration::from_millis(300) + self.rtt;
         let due = self
             .last_loss_decrease
             .map(|t| now.saturating_duration_since(t) >= interval)
             .unwrap_or(true);
+
         if due {
             let factor = 1.0 - 0.5 * loss;
             self.target_bps = ((self.target_bps as f64) * factor).round().max(1.0) as u64;
@@ -698,11 +712,13 @@ pub fn send_side_pushback(
     } else if queue_time > Duration::from_millis(250) {
         rate = rate * 9 / 10;
     }
+
     if let Some(cwnd) = congestion_window_bytes {
         if in_flight_bytes > cwnd {
             rate = rate / 2;
         }
     }
+
     rate.max(1)
 }
 
@@ -745,6 +761,7 @@ impl InterArrival {
             .iter()
             .filter_map(|p| p.receive_time.map(|r| (p.send_time, r, p.size_bytes)))
             .collect();
+
         pkts.sort_by_key(|(s, _, _)| *s);
 
         for (send, recv, size) in pkts {
@@ -771,6 +788,7 @@ impl InterArrival {
                                 out.push((sd, rd));
                             }
                         }
+
                         self.prev_complete = Some(completed);
                         self.current = Some(ArrivalGroup {
                             first_send: send,
@@ -782,6 +800,7 @@ impl InterArrival {
                 }
             }
         }
+
         out
     }
 }
@@ -830,7 +849,9 @@ impl TrendlineEstimator {
             .back()
             .map(|(a, _)| a + recv_delta.as_secs_f64() * 1000.0)
             .unwrap_or(0.0);
+
         self.points.push_back((arrival, self.smoothed));
+
         while self.points.len() > self.window {
             self.points.pop_front();
         }
@@ -846,6 +867,7 @@ impl TrendlineEstimator {
         } else {
             self.threshold += 0.039 * (abs_m - self.threshold);
         }
+
         self.threshold = self.threshold.clamp(6.0, 600.0);
 
         if modified > self.threshold {
@@ -861,6 +883,7 @@ impl TrendlineEstimator {
             self.overuse_time = Duration::ZERO;
             self.state = NetworkState::Normal;
         }
+
         self.state
     }
 }
@@ -870,6 +893,7 @@ fn linear_slope(points: &VecDeque<(f64, f64)>) -> Option<f64> {
     if n < 2 {
         return None;
     }
+
     let mut sum_x = 0.0;
     let mut sum_y = 0.0;
     let mut sum_xx = 0.0;
@@ -880,11 +904,13 @@ fn linear_slope(points: &VecDeque<(f64, f64)>) -> Option<f64> {
         sum_xx += x * x;
         sum_xy += x * y;
     }
+
     let nf = n as f64;
     let denom = nf * sum_xx - sum_x * sum_x;
     if denom.abs() < 1e-9 {
         return Some(0.0);
     }
+
     Some((nf * sum_xy - sum_x * sum_y) / denom)
 }
 
@@ -985,6 +1011,7 @@ impl ProbeController {
         if !in_alr {
             return Vec::new();
         }
+
         let due = self
             .last_alr_probe
             .map(|t| now.saturating_duration_since(t) >= ALR_PROBE_INTERVAL)
@@ -992,15 +1019,18 @@ impl ProbeController {
         if !due {
             return Vec::new();
         }
+
         self.last_alr_probe = Some(now);
         let target = (estimate_bps.saturating_mul(2))
             .clamp(self.min_bps, self.max_bps.min(PROBE_MAX_BITRATE_BPS));
+
         vec![self.cluster(target)]
     }
 
     fn cluster(&mut self, target_bps: u64) -> ProbeCluster {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
+
         ProbeCluster {
             id,
             target_bps: target_bps.clamp(self.min_bps, self.max_bps.min(PROBE_MAX_BITRATE_BPS)),

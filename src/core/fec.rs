@@ -1,4 +1,4 @@
-//! XOR forward-error correction (**sans-I/O**), WebRTC ULPFEC / FlexFEC style.
+//! XOR forward-error correction, WebRTC ULPFEC / FlexFEC style.
 //!
 //! Generates [`crate::core::packet::Packet::Fec`] parity over **full Media datagrams**
 //! (fixed [`HEADER_SIZE`] header + body) and recovers a missing media packet
@@ -99,7 +99,6 @@
 //!
 //! - Maximum media packets per protection block: [`MAX_MEDIA_PACKETS`] (48).
 //! - FEC packets must **not** be NACK'd or retransmitted.
-//! - Networking stays outside this module (sans-I/O).
 
 use std::collections::VecDeque;
 
@@ -107,13 +106,7 @@ use ahash::{HashMap, HashMapExt};
 use bytes::Bytes;
 
 use crate::core::packet::{
-    DecodeError,
-    FEC_BODY_HEADER_SIZE,
-    Flags,
-    HEADER_SIZE,
-    Header,
-    Packet,
-    PacketType,
+    DecodeError, FEC_BODY_HEADER_SIZE, Flags, HEADER_SIZE, Header, Packet, PacketType,
 };
 
 /// Maximum media packets in one FEC protection block (WebRTC `kUlpfecMaxMediaPackets`).
@@ -165,6 +158,7 @@ pub fn num_fec_packets(num_media: usize, fec_rate: u8) -> usize {
     if num_media == 0 || fec_rate == 0 {
         return 0;
     }
+
     let n = (num_media * usize::from(fec_rate) + 128) / 256;
     n.max(1).min(num_media)
 }
@@ -308,6 +302,7 @@ impl FecPacketOwned {
         let pkt = self.as_packet();
         let mut buf = vec![0u8; pkt.encoded_len()];
         pkt.encode(&mut buf);
+
         Bytes::from(buf)
     }
 
@@ -418,6 +413,7 @@ impl FecGenerator {
         }
 
         self.pending.push((media_seq, wire));
+
         Ok(produced)
     }
 
@@ -688,6 +684,7 @@ impl FecReceiver {
         if self.media.contains_key(&key) {
             return Vec::new();
         }
+
         self.media.insert(key, wire);
         self.evict_if_needed();
         self.recover_all()
@@ -748,10 +745,12 @@ impl FecReceiver {
             length_xor,
             payload,
         });
+
         // Keep FEC list from growing without bound.
         while self.fec.len() > self.capacity {
             self.fec.pop_front();
         }
+
         self.recover_all()
     }
 
@@ -771,13 +770,16 @@ impl FecReceiver {
                     }
                 }
             }
+
             if !progressed {
                 break;
             }
         }
+
         if !out.is_empty() {
             self.evict_if_needed();
         }
+
         out
     }
 
@@ -785,6 +787,7 @@ impl FecReceiver {
         if self.media.len() <= self.capacity {
             return;
         }
+
         // Drop arbitrary oldest-ish half by clearing lowest seq keys first.
         let mut keys: Vec<(u8, u16)> = self.media.keys().copied().collect();
         keys.sort_by(|a, b| {
@@ -795,6 +798,7 @@ impl FecReceiver {
                 da.cmp(&db)
             })
         });
+
         let remove_n = self.media.len() - self.capacity;
         for key in keys.into_iter().take(remove_n) {
             self.media.remove(&key);
@@ -820,6 +824,7 @@ fn try_recover_row(row: &StoredFec, media: &HashMap<(u8, u16), Bytes>) -> Option
         if row.mask & (1u64 << bit) == 0 {
             continue;
         }
+
         let seq = row.seq_base.wrapping_add(bit);
         match media.get(&(row.stream_id, seq)) {
             Some(wire) => {
@@ -828,6 +833,7 @@ fn try_recover_row(row: &StoredFec, media: &HashMap<(u8, u16), Bytes>) -> Option
                     // Inconsistent FEC / media —cannot recover safely.
                     return None;
                 }
+
                 xor_bytes(&mut buf, wire);
             }
             None => {
@@ -835,6 +841,7 @@ fn try_recover_row(row: &StoredFec, media: &HashMap<(u8, u16), Bytes>) -> Option
                 if missing_count > 1 {
                     return None;
                 }
+
                 missing_bit = Some(bit);
             }
         }
@@ -843,15 +850,18 @@ fn try_recover_row(row: &StoredFec, media: &HashMap<(u8, u16), Bytes>) -> Option
     if missing_count != 1 {
         return None;
     }
+
     let bit = missing_bit?;
     let miss_len = usize::from(length_acc);
     if miss_len > buf.len() {
         return None;
     }
+
     // Residual beyond miss_len should be zero if the FEC row is consistent.
     if buf[miss_len..].iter().any(|&b| b != 0) {
         return None;
     }
+
     buf.truncate(miss_len);
 
     // Sanity: recovered bytes must decode as Media with matching seq / stream.

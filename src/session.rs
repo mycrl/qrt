@@ -1,4 +1,4 @@
-//! Sync media session over [`crate::core`] (**sans-I/O**).
+//! Sync media session over [`crate::core`].
 //!
 //! Models WebRTC's **Call + streams** split:
 //!
@@ -36,17 +36,8 @@ use tokio::sync::Notify;
 
 use crate::{
     codec::{
-        CodecRateParams,
-        EncodedFrame,
-        EncodedFrameReceiver,
-        EncodedFrameSender,
-        Encoder,
-        InboundFrameQueue,
-        MediaKind,
-        PendingFrameQueue,
-        PushError,
-        WakeNotify,
-        push_inbound,
+        CodecRateParams, EncodedFrame, EncodedFrameReceiver, EncodedFrameSender, Encoder,
+        InboundFrameQueue, MediaKind, PendingFrameQueue, PushError, WakeNotify, push_inbound,
     },
     core::{
         bwe::{BandwidthEstimator, BweConfig, NetworkState, RateUpdate, send_side_pushback},
@@ -55,11 +46,7 @@ use crate::{
         fragment::{FragmentParams, PayloadSizeLimits, fragment},
         history::{PacketHistory, RetransRateLimiter, RetransmitOutcome},
         jitter::{
-            AudioJitterConfig,
-            AudioNetEq,
-            AudioPacket,
-            VideoFrameBuffer,
-            VideoJitterConfig,
+            AudioJitterConfig, AudioNetEq, AudioPacket, VideoFrameBuffer, VideoJitterConfig,
             VideoPoll,
         },
         nack::{NackConfig, NackRequester},
@@ -272,6 +259,7 @@ impl Track {
         } else {
             None
         };
+
         let (video_jitter, audio_jitter) = match config.kind {
             MediaKind::Video => (
                 Some(VideoFrameBuffer::new(stream, config.video_jitter)),
@@ -279,6 +267,7 @@ impl Track {
             ),
             MediaKind::Audio => (None, Some(AudioNetEq::new(stream, config.audio_jitter))),
         };
+
         Self {
             stream_id: stream,
             kind: config.kind,
@@ -303,7 +292,7 @@ impl Track {
 
 /// End-to-end transport session: register tracks, feed UDP.
 ///
-/// Sans-I/O: call [`Self::poll_datagram`] / [`Self::handle_datagram`] from your
+/// Call [`Self::poll_datagram`] / [`Self::handle_datagram`] from your
 /// socket loop with a host [`Instant`]. Allocate an [`EncodedFrameSender`] with
 /// [`Self::alloc_outbound`], create the encoder, then
 /// [`Self::register_track`]. Decoders pull via [`RemoteTrack::receiver`] after
@@ -409,8 +398,10 @@ impl Session {
             config.bwe.start_bitrate_bps,
             Duration::from_millis(500),
         ));
+
         let bwe = BandwidthEstimator::new(config.bwe.clone());
         let pacer = Pacer::new(config.pacer.clone());
+
         Self {
             fec_rx: FecReceiver::new(256),
             history,
@@ -495,6 +486,7 @@ impl Session {
         if self.tracks.contains_key(&stream_id) {
             return Err(QrtError::TrackExists { stream_id });
         }
+
         let (receiver, inbound, inbound_notify) = EncodedFrameReceiver::pair();
         let mut track = Track::new(
             config,
@@ -503,8 +495,10 @@ impl Session {
             inbound,
             Arc::clone(&inbound_notify),
         );
+
         track.set_rtt(self.rtt);
         self.tracks.insert(stream_id, track);
+
         Ok(RemoteTrack {
             stream_id,
             kind,
@@ -520,6 +514,7 @@ impl Session {
                 let Some(track) = self.tracks.get(&id) else {
                     break;
                 };
+
                 push_inbound(&track.inbound, &track.inbound_notify, frame);
             }
         }
@@ -569,6 +564,7 @@ impl Session {
         if frame.payload.is_empty() {
             return Err(PushError::EmptyFrame);
         }
+
         let ttl = frame.ttl_ms.unwrap_or(self.config.default_ttl_ms);
         if ttl == 0 {
             return Ok(());
@@ -627,19 +623,23 @@ impl Session {
                     let _ = fec.push(seq, wire);
                 }
             }
+
             if let Some(fec) = track.fec_gen.as_mut() {
                 fec_owned.extend(fec.flush());
             }
+
             (packets, fec_owned)
         };
 
         for pkt in &packets {
             self.pacer.enqueue_packet(pkt, now);
         }
+
         for owned in fec_owned {
             let pkt = owned.as_packet();
             self.pacer.enqueue_packet(&pkt, now);
         }
+
         Ok(())
     }
 
@@ -654,6 +654,7 @@ impl Session {
         let Some(tseq) = self.transport_seqs.stamp(&mut wire) else {
             return Some(Bytes::from(wire));
         };
+
         outgoing.wire = Bytes::from(wire);
 
         let header = Header::decode(&outgoing.wire).ok();
@@ -685,6 +686,7 @@ impl Session {
         let Ok(packet) = Packet::decode(datagram) else {
             return;
         };
+
         let header = packet.header().clone();
         self.arrival_rx
             .on_packet(header.transport_seq, now, datagram.len());
@@ -720,6 +722,7 @@ impl Session {
                             self.set_rtt(sample);
                         }
                     }
+
                     if let Some(update) = self.bwe.on_feedback(&report, self.rtt, now) {
                         self.apply_rate_update(update, now);
                     }
@@ -755,6 +758,7 @@ impl Session {
                 return Some(frame);
             }
         }
+
         None
     }
 
@@ -794,6 +798,7 @@ impl Session {
         let neteq = track.audio_jitter.as_mut()?;
         let tick = neteq.get_decision(now);
         let packet = tick.packet?;
+
         Some(EncodedFrame {
             stream_id: packet.stream_id,
             timestamp: packet.timestamp,
@@ -822,20 +827,24 @@ impl Session {
             if !nack_due {
                 continue;
             }
+
             track.last_nack_at = Some(now);
             let batch = track.nack.process(now);
             for pkt in batch.to_packets(track.stream_id, default_ttl) {
                 nack_packets.push(pkt);
             }
+
             if batch.ask_keyframe {
                 if let Some(jitter) = track.video_jitter.as_ref() {
                     keyframe_reqs.push(jitter.keyframe_packet(default_ttl));
                 }
             }
         }
+
         for pkt in nack_packets {
             self.pacer.enqueue_packet(&pkt, now);
         }
+
         for pkt in keyframe_reqs {
             self.pacer.enqueue_packet(&pkt, now);
         }
@@ -884,6 +893,7 @@ impl Session {
         let Ok(packet) = Packet::decode(wire) else {
             return;
         };
+
         if let Ok(outcome) = self.reasm.push(&packet) {
             if let Some(assembled) = outcome.into_assembled() {
                 if let Some(track) = self.tracks.get_mut(&assembled.stream_id) {
@@ -917,6 +927,7 @@ impl Session {
             self.feedback_tx.in_flight_bytes(),
             None,
         );
+
         let mut update = update;
         update.target_bitrate_bps = pushed;
         update.pacing_rate_bps = ((pushed as f64) * self.config.bwe.pacing_factor)
@@ -958,6 +969,7 @@ impl Session {
         } else {
             0
         };
+
         let video_budget = update.target_bitrate_bps.saturating_sub(audio_budget);
         let per_video = video_budget / video_n as u64;
         let per_audio = if audio_n > 0 {
@@ -991,8 +1003,10 @@ impl Session {
                 let Some(track) = self.tracks.get(&id) else {
                     continue;
                 };
+
                 track.pending.lock().drain(..).collect()
             };
+
             for (frame, at) in batch {
                 let _ = self.enqueue_frame(frame, at);
             }

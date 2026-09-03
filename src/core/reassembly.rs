@@ -166,8 +166,10 @@ impl IncompleteFrame {
         if frag_count == 0 {
             return Err(ReassemblyError::Conflict("frag_count is 0"));
         }
+
         let mut slots = Vec::with_capacity(frag_count as usize);
         slots.resize(frag_count as usize, None);
+
         Ok(Self {
             frag_count,
             timestamp,
@@ -183,10 +185,12 @@ impl IncompleteFrame {
         if self.received != self.frag_count {
             return None;
         }
+
         let mut out = Vec::new();
         for slot in &self.slots {
             out.extend_from_slice(slot.as_ref().expect("slot filled when received == count"));
         }
+
         Some(AssembledFrame {
             stream_id,
             frame_id,
@@ -324,9 +328,11 @@ impl FrameReassembler {
         if frame.frag_count != header.frag_count {
             return Err(ReassemblyError::Conflict("frag_count mismatch"));
         }
+
         if frame.timestamp != header.timestamp {
             return Err(ReassemblyError::Conflict("timestamp mismatch"));
         }
+
         if frame.slots.len() != header.frag_count as usize {
             return Err(ReassemblyError::Conflict("internal slot size"));
         }
@@ -375,9 +381,11 @@ impl FrameReassembler {
         if self.completed_history == 0 {
             return;
         }
+
         if self.completed.insert(key, ()).is_none() {
             self.completed_order.push_back(key);
         }
+
         while self.completed_order.len() > self.completed_history {
             if let Some(old) = self.completed_order.pop_front() {
                 self.completed.remove(&old);

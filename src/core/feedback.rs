@@ -1,4 +1,4 @@
-//! Transport-wide arrival feedback (**sans-I/O**), TWCC / transport-cc role.
+//! Transport-wide arrival feedback, TWCC / transport-cc role.
 //!
 //! Receiver records every datagram by [`Header::transport_seq`] and periodically
 //! emits [`Packet::ArrivalFeedback`]. Sender matches feedback against a local
@@ -62,7 +62,6 @@
 //!
 //! - Always key on **transport_seq**, never `media_seq` (RTX/FEC must be visible).
 //! - In-flight includes retransmits and FEC once `on_sent` recorded them.
-//! - Networking stays outside this module.
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -72,12 +71,7 @@ use std::{
 use bytes::Bytes;
 
 use crate::core::packet::{
-    ARRIVAL_RECV_DELTA_TICK,
-    Flags,
-    HEADER_SIZE,
-    Header,
-    Packet,
-    PacketType,
+    ARRIVAL_RECV_DELTA_TICK, Flags, HEADER_SIZE, Header, Packet, PacketType,
 };
 
 /// Bits covered by one [`Packet::ArrivalFeedback`] mask.
@@ -140,7 +134,9 @@ impl ArrivalFeedbackOwned {
     pub fn to_wire(&self) -> Bytes {
         let pkt = self.as_packet();
         let mut buf = vec![0u8; pkt.encoded_len()];
+
         pkt.encode(&mut buf);
+
         Bytes::from(buf)
     }
 }
@@ -196,9 +192,11 @@ impl ArrivalRecorder {
             Some(n) => n,
             None => transport_seq,
         });
+
         if self.next_base.is_none() {
             self.next_base = Some(transport_seq);
         }
+
         self.prune(now);
     }
 
@@ -211,6 +209,7 @@ impl ArrivalRecorder {
                 return None;
             }
         }
+
         self.build_window(now)
     }
 
@@ -221,6 +220,7 @@ impl ArrivalRecorder {
 
     fn build_window(&mut self, now: Instant) -> Option<ArrivalFeedbackOwned> {
         self.prune(now);
+
         let mut base = self.next_base?;
 
         // If the current window is empty but newer arrivals exist, jump to the
@@ -231,6 +231,7 @@ impl ArrivalRecorder {
             let Some((&oldest, _)) = self.received.iter().next() else {
                 return None;
             };
+
             base = oldest;
         }
 
@@ -259,11 +260,11 @@ impl ArrivalRecorder {
                 let ticks = (us / 250).min(u128::from(u16::MAX)) as u16;
                 deltas.push(ticks);
             }
+
             prev = t;
         }
 
         let delta_bytes = Packet::encode_arrival_recv_deltas(&deltas);
-
         let owned = ArrivalFeedbackOwned {
             header: Header {
                 packet_type: PacketType::ArrivalFeedback,
@@ -286,6 +287,7 @@ impl ArrivalRecorder {
 
         self.next_base = Some(base.wrapping_add(ARRIVAL_MASK_BITS));
         self.last_emit = Some(now);
+
         Some(owned)
     }
 
@@ -385,6 +387,7 @@ impl FeedbackAdapter {
             size_bytes,
             audio,
         });
+
         self.cull(send_time);
     }
 
@@ -429,6 +432,7 @@ impl FeedbackAdapter {
                     if idx > 0 {
                         acc += ARRIVAL_RECV_DELTA_TICK * u32::from(ticks);
                     }
+
                     spans.push(acc);
                 }
                 let total = *spans.last().unwrap_or(&Duration::ZERO);
@@ -452,7 +456,9 @@ impl FeedbackAdapter {
             let Some(sent) = self.history.iter().find(|p| p.transport_seq == seq) else {
                 continue;
             };
+
             let receive_time = recv_times.get(&seq).copied();
+
             // Covered by this window (acked or lost) → leave in-flight.
             self.acked.insert(seq, feedback_time);
             packets.push(PacketResult {
@@ -546,6 +552,7 @@ impl TransportSeqAssigner {
     pub fn next(&mut self) -> u16 {
         let s = self.next;
         self.next = self.next.wrapping_add(1);
+
         s
     }
 
@@ -554,10 +561,12 @@ impl TransportSeqAssigner {
         if wire.len() < HEADER_SIZE {
             return None;
         }
+
         let mut header = Header::decode(wire).ok()?;
         let seq = self.next();
         header.transport_seq = seq;
         header.encode(wire);
+
         Some(seq)
     }
 }

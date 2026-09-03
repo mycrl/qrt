@@ -1,4 +1,4 @@
-//! Receive-side jitter / playout buffering (**sans-I/O**).
+//! Receive-side jitter / playout buffering.
 //!
 //! Two complementary controllers live here:
 //!
@@ -271,6 +271,7 @@ impl VideoFrameBuffer {
         let raw = self
             .jitter_estimate
             .saturating_add(self.config.render_delay);
+
         raw.max(self.config.min_delay).min(self.config.max_delay)
     }
 
@@ -317,6 +318,7 @@ impl VideoFrameBuffer {
         if frame.stream_id != self.stream_id {
             return;
         }
+
         if self
             .frames
             .iter()
@@ -333,6 +335,7 @@ impl VideoFrameBuffer {
             let next = 0.85 * j + 0.15 * g;
             self.jitter_estimate = Duration::from_secs_f64((next / 1000.0).clamp(0.0, 1.0));
         }
+
         self.last_arrival = Some(now);
         self.last_push_at = Some(now);
 
@@ -342,9 +345,11 @@ impl VideoFrameBuffer {
             arrived_at: now,
             deadline,
         });
+
         self.frames
             .make_contiguous()
             .sort_by_key(|s| s.frame.frame_id);
+
         self.trim_overflow();
     }
 
@@ -366,6 +371,7 @@ impl VideoFrameBuffer {
             if let Some(req) = self.maybe_keyframe_on_stall(now) {
                 return req;
             }
+
             return VideoPoll::Wait;
         }
 
@@ -375,6 +381,7 @@ impl VideoFrameBuffer {
             if !late || self.frames.len() < 2 {
                 break;
             }
+
             let dropped = self.frames.pop_front().expect("front checked");
             // Skipping a frame breaks opaque delta chains → need a keyframe.
             if !dropped.frame.flags.key {
@@ -382,6 +389,7 @@ impl VideoFrameBuffer {
             } else {
                 self.last_decoded = Some(dropped.frame.frame_id);
             }
+
             return VideoPoll::DroppedLate {
                 frame_id: dropped.frame.frame_id,
                 payload_len: dropped.frame.payload.len(),
@@ -468,9 +476,11 @@ impl VideoFrameBuffer {
         if self.keyframe_required {
             return frame.flags.key;
         }
+
         if frame.flags.key {
             return true;
         }
+
         match self.last_decoded {
             None => frame.flags.key,
             Some(id) => frame.frame_id == id.wrapping_add(1) || frame.flags.key,
@@ -506,9 +516,11 @@ impl VideoFrameBuffer {
         if !receiving && self.frames.is_empty() {
             return None;
         }
+
         if now.saturating_duration_since(last_activity) < self.config.stall_timeout {
             return None;
         }
+
         // No progress decoding.
         if self.last_decoded_at.is_some()
             && now.saturating_duration_since(self.last_decoded_at.unwrap())
@@ -516,6 +528,7 @@ impl VideoFrameBuffer {
         {
             return None;
         }
+
         self.try_keyframe_req(now)
     }
 
@@ -525,8 +538,10 @@ impl VideoFrameBuffer {
                 return None;
             }
         }
+
         self.last_keyframe_req = Some(now);
         self.keyframe_required = true;
+
         Some(VideoPoll::KeyframeReq {
             stream_id: self.stream_id,
         })
@@ -621,7 +636,7 @@ pub struct AudioTick {
     pub buffer_delay: Duration,
 }
 
-/// Audio jitter buffer + NetEQ **decision** skeleton (**sans-I/O**).
+/// Audio jitter buffer + NetEQ **decision** skeleton.
 ///
 /// Maintains a packet queue, adapts a target delay from arrival spacing
 /// (simplified histogram / EWMA), and emits [`AudioDecision`] each tick.
@@ -719,6 +734,7 @@ impl AudioNetEq {
         if packet.stream_id != self.stream_id {
             return;
         }
+
         if let Some(prev) = self.last_arrival {
             let gap = packet.arrived_at.saturating_duration_since(prev);
             let a = self.arrival_ewma.as_secs_f64() * 1000.0;
@@ -731,6 +747,7 @@ impl AudioNetEq {
                 .max(self.config.min_delay)
                 .min(self.config.max_delay);
         }
+
         self.last_arrival = Some(packet.arrived_at);
 
         if let Some(i) = self

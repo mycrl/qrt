@@ -1,9 +1,6 @@
-//! Prioritized send queue with TTL drop (**sans-I/O**).
+//! Prioritized send queue with TTL drop.
 //!
-//! Holds already-encoded UDP payloads waiting for the [`crate::core::pacer`]. There is
-//! **no** socket or timer thread here: the host application owns I/O and only
-//! calls [`SendQueue::enqueue`] / [`SendQueue::pop`] with an [`Instant`] it
-//! controls.
+//! Holds already-encoded UDP payloads waiting for the [`crate::core::pacer`].
 //!
 //! # How it works
 //!
@@ -243,8 +240,10 @@ impl OutgoingPacket {
         if header.ttl_ms == 0 {
             return None;
         }
+
         let mut wire = vec![0u8; packet.encoded_len()];
         packet.encode(&mut wire);
+
         Some(Self {
             wire: Bytes::from(wire),
             priority: Priority::of(header),
@@ -394,7 +393,9 @@ impl SendQueue {
                 self.stats.dropped_expired += 1;
                 continue;
             }
+
             self.stats.dequeued += 1;
+
             return Some(packet);
         }
     }

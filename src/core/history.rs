@@ -1,4 +1,4 @@
-//! Send-side retransmission history (**sans-I/O**).
+//! Send-side retransmission history.
 //!
 //! Stores Media datagrams **after** they have been paced onto the wire so a
 //! later [`crate::core::packet::Packet::Nack`] can clone them with
@@ -220,6 +220,7 @@ impl PacketHistory {
                     retransmit_count: 0,
                 },
             );
+
             return;
         }
 
@@ -253,9 +254,11 @@ impl PacketHistory {
         let Ok(header) = Header::decode(&packet.wire) else {
             return;
         };
+
         if header.packet_type != PacketType::Media || header.flags.retrans {
             return;
         }
+
         self.put(
             header.stream_id,
             header.media_seq,
@@ -286,9 +289,11 @@ impl PacketHistory {
         if now >= entry.deadline {
             return RetransmitOutcome::Expired;
         }
+
         if entry.pending {
             return RetransmitOutcome::AlreadyPending;
         }
+
         if now.saturating_duration_since(entry.last_sent_at) < self.rtt {
             return RetransmitOutcome::TooSoon;
         }
@@ -320,6 +325,7 @@ impl PacketHistory {
 
         let entry = self.entries.get_mut(&key).expect("key checked");
         entry.pending = true;
+
         RetransmitOutcome::Ready(out)
     }
 
@@ -347,8 +353,10 @@ impl PacketHistory {
             if !keep {
                 self.entries.remove(key);
             }
+
             keep
         });
+
         while self.entries.len() > self.capacity {
             if let Some(old) = self.order.pop_front() {
                 self.entries.remove(&old);
@@ -408,6 +416,7 @@ impl RetransRateLimiter {
     pub fn from_target_bps(target_bps: u64, window: Duration) -> Self {
         let ms = window.as_millis() as u64;
         let budget = target_bps.saturating_mul(ms) / 8 / 1000;
+
         Self::new(window, budget.max(1))
     }
 
@@ -427,7 +436,9 @@ impl RetransRateLimiter {
         if self.used_bytes.saturating_add(nbytes) > self.budget_bytes {
             return false;
         }
+
         self.used_bytes = self.used_bytes.saturating_add(nbytes);
+
         true
     }
 
@@ -452,6 +463,7 @@ fn with_retrans_flag(wire: &[u8], ttl_ms: u16) -> Option<Bytes> {
     if header.packet_type != PacketType::Media {
         return None;
     }
+
     header.flags.retrans = true;
     header.transport_seq = 0;
     header.ttl_ms = ttl_ms;
@@ -460,6 +472,8 @@ fn with_retrans_flag(wire: &[u8], ttl_ms: u16) -> Option<Bytes> {
     if out.len() < HEADER_SIZE {
         return None;
     }
+
     header.encode(&mut out);
+
     Some(Bytes::from(out))
 }

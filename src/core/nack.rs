@@ -1,4 +1,4 @@
-//! Receive-side NACK list (**sans-I/O**).
+//! Receive-side NACK list.
 //!
 //! Tracks missing [`Header::media_seq`] gaps and periodically emits
 //! [`Packet::Nack`] bodies (RFC 4585 Generic NACK role). Aligns with WebRTC
@@ -355,16 +355,19 @@ impl NackRequester {
             if remove.contains(seq) {
                 continue;
             }
+
             // Abandon: retransmission would arrive after useful lifetime.
             if now.saturating_duration_since(info.created_at) + rtt.saturating_mul(2) >= lifetime {
                 remove.push(*seq);
                 continue;
             }
+
             if info.retries >= max_retries {
                 remove.push(*seq);
                 batch.ask_keyframe = true;
                 continue;
             }
+
             if now >= info.send_at {
                 to_send.push(*seq);
                 info.retries = info.retries.saturating_add(1);
@@ -377,6 +380,7 @@ impl NackRequester {
         }
 
         batch.entries = Packet::nack_pack_seqs(to_send);
+
         batch
     }
 

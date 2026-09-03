@@ -917,24 +917,30 @@ impl<'a> Packet<'a> {
         if seqs.is_empty() {
             return Vec::new();
         }
+
         seqs.sort_unstable();
         seqs.dedup();
+
         let mut out = Vec::new();
         let mut i = 0;
         while i < seqs.len() {
             let base = seqs[i];
             let mut blp = 0u16;
             i += 1;
+
             while i < seqs.len() {
                 let d = seqs[i].wrapping_sub(base);
                 if d == 0 || d > 16 {
                     break;
                 }
+
                 blp |= 1 << (d - 1);
                 i += 1;
             }
+
             out.push((base, blp));
         }
+
         out
     }
 }

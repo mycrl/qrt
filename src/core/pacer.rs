@@ -1,9 +1,8 @@
-//! Leaky-bucket media pacer (**sans-I/O**).
+//! Leaky-bucket media pacer.
 //!
 //! Schedules [`OutgoingPacket`]s from an internal [`SendQueue`] using the same
 //! debt model as WebRTC's `PacingController`
-//! (`modules/pacing/pacing_controller.*`). The host supplies time via
-//! [`Instant`]; this module never sleeps, spawns tasks, or opens sockets.
+//! (`modules/pacing/pacing_controller.*`).
 //!
 //! # How it works
 //!
@@ -127,7 +126,7 @@ impl Default for PacerConfig {
     }
 }
 
-/// Sans-I/O pacer wrapping a [`SendQueue`].
+/// Pacer wrapping a [`SendQueue`].
 #[derive(Debug)]
 pub struct Pacer {
     queue: SendQueue,
@@ -201,6 +200,7 @@ impl Pacer {
             self.media_debt_bytes = self.media_debt_bytes.saturating_add(packet.len() as u64);
             self.clamp_debt();
         }
+
         Some(packet)
     }
 
@@ -211,23 +211,28 @@ impl Pacer {
         if self.queue.is_empty() {
             return None;
         }
+
         if !self.config.account_for_audio {
             if let Some(Priority::Audio) = self.queue.peek_priority() {
                 return Some(now);
             }
         }
+
         if self.can_send_paced() {
             return Some(now);
         }
+
         let rate = self.effective_rate_bps();
         if rate == 0 {
             return Some(now + self.config.burst_interval);
         }
+
         let budget = self.burst_budget_bytes();
         let need = self.media_debt_bytes.saturating_sub(budget);
         if need == 0 {
             return Some(now);
         }
+
         let us = (u128::from(need) * 8 * 1_000_000) / u128::from(rate);
         Some(now + Duration::from_micros(us as u64))
     }
@@ -237,9 +242,11 @@ impl Pacer {
             self.last_update = Some(now);
             return;
         };
+
         if now <= last {
             return;
         }
+
         let elapsed = now - last;
         self.last_update = Some(now);
 
@@ -254,6 +261,7 @@ impl Pacer {
         if self.effective_rate_bps() == 0 {
             return false;
         }
+
         self.media_debt_bytes <= self.burst_budget_bytes()
     }
 
@@ -277,6 +285,7 @@ impl Pacer {
         if base == 0 {
             return 0;
         }
+
         match self.queue.expected_queue_time(base) {
             Some(q) if q > self.config.queue_time_limit => {
                 let bytes = self.queue.queued_bytes() as u128;
@@ -293,6 +302,7 @@ fn bytes_for_rate(rate_bps: u64, window: Duration) -> u64 {
     if rate_bps == 0 {
         return 0;
     }
+
     let us = window.as_micros();
     ((u128::from(rate_bps) * us) / (8 * 1_000_000)) as u64
 }

@@ -1,4 +1,4 @@
-//! Application-facing codec boundary (**sans-I/O**).
+//! Application-facing codec boundary.
 //!
 //! Transport owns congestion and reliability. Codec wiring:
 //!
@@ -397,6 +397,7 @@ impl EncodedFrameReceiver {
             if let Some(frame) = self.try_recv() {
                 return frame;
             }
+
             self.notify.notified().await;
         }
     }

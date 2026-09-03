@@ -231,9 +231,11 @@ pub fn split_about_equally(payload_len: usize, limits: &PayloadSizeLimits) -> Ve
                 current_packet_bytes = 1;
             }
         }
+
         if current_packet_bytes > remaining_data {
             current_packet_bytes = remaining_data;
         }
+
         // Leave at least one byte for the final packet.
         if num_packets_left == 2 && current_packet_bytes == remaining_data {
             current_packet_bytes -= 1;

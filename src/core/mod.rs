@@ -1,8 +1,6 @@
-//! Transport core: packet codec, reliability, pacing, BWE, and jitter (**sans-I/O**).
+//! Transport core: packet codec, reliability, pacing, BWE, and jitter.
 //!
-//! This is the UDP media pipeline. It never opens a socket or sleeps; the host
-//! ([`crate::Session`] / [`crate::Qrt`]) feeds [`std::time::Instant`]s and
-//! datagrams. Encoder/decoder wiring lives in [`crate::codec`]. Core never
+//! Encoder/decoder wiring lives in [`crate::codec`]. Core never
 //! interprets codec payload bytes — only [`packet::Packet`] headers, seqs, and
 //! feedback bodies.
 //!

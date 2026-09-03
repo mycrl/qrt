@@ -1,8 +1,7 @@
-//! Datagram I/O boundary for [`crate::Qrt`] (**injected**).
+//! Datagram I/O boundary for [`crate::Qrt`].
 //!
-//! [`Session`](crate::Session) stays sans-I/O. Timers are Tokio
-//! ([`tokio::time`]) inside [`crate::Qrt`]; this trait is only bare UDP
-//! send/recv (no QUIC).
+//! Timers are Tokio ([`tokio::time`]) inside [`crate::Qrt`]; this trait is only
+//! bare UDP send/recv (no QUIC).
 
 use std::future::Future;
 

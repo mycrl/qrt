@@ -12,7 +12,6 @@ QRT is for a **known peer** over UDP where that surface is cost, not value:
 
 - No NAT traversal, signaling, or SRTP handshake in the hot path.
 - One packet family, one socket, one pacer — feedback is not a second protocol.
-- Core is **sans-I/O**: state machines take `Instant` and datagrams; the host owns the socket (Tokio façade optional).
 - Codec-opaque: the transport never parses VP8/H.264 FU-A; frames are `frame_id` + `frag_index` / `frag_count`.
 - **Timeliness over reliability**: TTL/deadline drop beats delivering a stale frame. Expired packets are not retransmitted.
 - Encryption, ICE, and browser compatibility are out of scope unless added later.
