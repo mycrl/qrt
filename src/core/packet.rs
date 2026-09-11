@@ -329,7 +329,7 @@ impl Flags {
 /// unused placeholders; encoders should set `frag_count = 1`, `frag_index = 0`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Header {
-    /// Datagram kind (media, FEC, NACK, arrival feedback, or keyframe request).
+    /// Packet kind (media, FEC, NACK, arrival feedback, or keyframe request).
     pub packet_type: PacketType,
     /// Retrans / audio / keyframe hints (see [`Flags`]).
     pub flags: Flags,

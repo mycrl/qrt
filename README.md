@@ -2,7 +2,7 @@
 
 **QRT (Quick Real-time Transport)** is a real-time media transport over **bare UDP**.
 
-It copies WebRTC’s _ideas_ (pacing, GCC/GoogCC, NACK, XOR FEC, TWCC-style arrival feedback, jitter/NetEQ) and **not** WebRTC’s _wire_ (RTP/RTCP, ICE, DTLS, SDP). One 20-byte header carries media, FEC, and feedback on a single datagram path. There is no QUIC.
+It copies WebRTC’s _ideas_ (pacing, GCC/GoogCC, NACK, XOR FEC, TWCC-style arrival feedback, jitter/NetEQ) and **not** WebRTC’s _wire_ (RTP/RTCP, ICE, DTLS, SDP). One 20-byte header carries media, FEC, and feedback on a single UDP path. Session hello and track open/close use a separate **TCP** signal channel. There is no QUIC.
 
 ## Why this instead of WebRTC
 
@@ -10,8 +10,8 @@ libwebrtc is a full calling stack: ICE/STUN/TURN, SDP, DTLS-SRTP, RTP/RTCP (ofte
 
 QRT is for a **known peer** over UDP where that surface is cost, not value:
 
-- No NAT traversal, signaling, or SRTP handshake in the hot path.
-- One packet family, one socket, one pacer — feedback is not a second protocol.
+- No NAT traversal or SRTP handshake in the hot path (TCP signal + announced UDP port; no ICE).
+- One packet family, one UDP socket, one pacer — feedback is not a second protocol.
 - Codec-opaque: the transport never parses VP8/H.264 FU-A; frames are `frame_id` + `frag_index` / `frag_count`.
 - **Timeliness over reliability**: TTL/deadline drop beats delivering a stale frame. Expired packets are not retransmitted.
 - Encryption, ICE, and browser compatibility are out of scope unless added later.

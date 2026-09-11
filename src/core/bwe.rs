@@ -18,8 +18,9 @@
 //! 1. On each matched arrival feedback → [`BandwidthEstimator::on_feedback`].
 //! 2. On a ~25–100 ms timer → [`BandwidthEstimator::poll_probes`]; run clusters
 //!    on the pacer, then [`BandwidthEstimator::on_probe_result`].
-//! 3. Apply [`RateUpdate::pacing_rate_bps`] to the pacer and notify the
-//!    encoder via [`crate::codec::Encoder::on_rate_params`] (apps should not
+//! 3. Apply [`RateUpdate::pacing_rate_bps`] to the pacer and emit
+//!    [`crate::codec::CodecEvent::Rate`] (via the session) so [`crate::Qrt`] can
+//!    call [`crate::codec::Encoder::on_rate_params`] (apps should not
 //!    consume probe clusters themselves).
 //! 4. Optionally pass the encoder target through [`send_side_pushback`] when
 //!    the send queue or in-flight window is overloaded.

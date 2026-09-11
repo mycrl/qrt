@@ -200,6 +200,20 @@ impl ArrivalRecorder {
         self.prune(now);
     }
 
+    /// Earliest instant when [`Self::poll`] should be tried again.
+    ///
+    /// `None` when there is nothing pending to report (idle until the next
+    /// [`Self::on_packet`]).
+    pub fn next_poll_at(&self, now: Instant) -> Option<Instant> {
+        if self.received.is_empty() && self.next_base.is_none() {
+            return None;
+        }
+        Some(match self.last_emit {
+            None => now,
+            Some(last) => last + self.config.interval,
+        })
+    }
+
     /// Emits feedback when the interval elapsed and there is something to report.
     ///
     /// Returns `None` if not due or the next 64-seq window has no activity yet.

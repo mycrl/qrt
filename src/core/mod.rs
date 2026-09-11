@@ -50,7 +50,7 @@
 //!   → Fec    → fec::FecReceiver (maybe recover Media, then same as Media)
 //!   → Nack   → history::get_retransmission → pacer
 //!   → ArrivalFeedback → FeedbackAdapter → bwe → RateUpdate
-//!   → KeyframeReq → Encoder::on_keyframe_request
+//!   → KeyframeReq → EngineEvent::KeyframeRequest → host encoder
 //! ```
 //!
 //! FEC-recovered media is fed to NACK as well, so a repaired `media_seq` is
@@ -67,7 +67,7 @@
 //!        → RateUpdate { target, pacing, rtt, loss, probe_clusters }
 //!           ├─ pacer.set pacing_rate
 //!           ├─ history RetransRateLimiter (NACK must not starve media)
-//!           └─ Encoder::on_rate_params (after send_side_pushback)
+//!           └─ EngineEvent::RateChange → host encoder
 //! ```
 //!
 //! [`bwe`] is the controller; [`feedback`] is only the sensor. Probes are
@@ -76,26 +76,16 @@
 //!
 //! # Host loop
 //!
-//! Drive the state machines from a socket loop (this is what [`crate::Qrt`]
-//! does internally):
-//!
-//! ```text
-//! loop {
-//!   session.pump_inbound(now)          // jitter → EncodedFrameReceiver
-//!   while let Some(wire) = session.poll_datagram(now) { udp.send(wire) }
-//!   // wait: min(pacer.next_send_time, encoder wake, recv)
-//!   session.handle_datagram(recv, now)
-//! }
-//! ```
-//!
-//! [`crate::Session::poll_datagram`] also drains pending encoded frames and
-//! runs NACK / arrival-feedback / probe maintenance. Prefer that façade
-//! unless you are assembling a custom loop from these modules.
+//! Ordinary applications use [`crate::Engine`] rather than driving these
+//! components separately. Send its output datagrams over one UDP socket, feed
+//! inbound UDP payloads to [`crate::Engine::push_packet`], and call
+//! [`crate::Engine::tick`] at the returned absolute wake time. Frames and
+//! encoder-control events are returned in [`crate::TaskResult`].
 //!
 //! # Examples
 //!
-//! Round-trip the shared header (full pipelines live in [`packet`], [`pacer`],
-//! and [`crate::session::Session`]):
+//! Round-trip the shared header (full pipelines are composed by
+//! [`crate::Engine`]):
 //!
 //! ```
 //! use qrt::core::packet::{Flags, HEADER_SIZE, Header, Packet, PacketType};

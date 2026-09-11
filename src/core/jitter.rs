@@ -383,12 +383,10 @@ impl VideoFrameBuffer {
             }
 
             let dropped = self.frames.pop_front().expect("front checked");
-            // Skipping a frame breaks opaque delta chains → need a keyframe.
-            if !dropped.frame.flags.key {
-                self.keyframe_required = true;
-            } else {
-                self.last_decoded = Some(dropped.frame.frame_id);
-            }
+            // Skipping any frame breaks opaque delta chains → need a keyframe.
+            // Do not advance `last_decoded` for dropped keys: the decoder never
+            // saw them, so the next delta must not be treated as contiguous.
+            self.keyframe_required = true;
 
             return VideoPoll::DroppedLate {
                 frame_id: dropped.frame.frame_id,
@@ -428,6 +426,27 @@ impl VideoFrameBuffer {
         }
 
         VideoPoll::Wait
+    }
+
+    /// Earliest playout wake time while frames are buffered.
+    ///
+    /// Used by the session I/O loop to `sleep_until` instead of blind polling.
+    /// `None` when the buffer is empty (stall PLI is checked on UDP / NACK ticks
+    /// via [`Self::poll`]).
+    pub fn next_wake_at(&self, now: Instant) -> Option<Instant> {
+        let wake = self
+            .frames
+            .iter()
+            .map(|scheduled| {
+                // [`Self::poll`] releases when `now + late_grace >= deadline`.
+                scheduled
+                    .deadline
+                    .checked_sub(self.config.late_grace)
+                    .unwrap_or(scheduled.deadline)
+            })
+            .min()?;
+
+        Some(if wake < now { now } else { wake })
     }
 
     /// Builds an owned [`Packet::KeyframeReq`] for this stream.
