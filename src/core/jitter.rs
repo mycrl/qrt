@@ -7,7 +7,7 @@
 //! | Video | [`VideoFrameBuffer`] | `FrameBuffer` + `VCMTiming` / deadline drop |
 //! | Audio | [`AudioNetEq`] | NetEQ **decision** skeleton (not full WSOLA) |
 //!
-//! Both sit **after** [`crate::core::reassembly::FrameReassembler`] (video) or after
+//! Both sit **after** [`crate::core::fragment::Reassembly`] (video) or after
 //! demux of complete audio packets. They decide *when* to release media to the
 //! decoder / renderer and when to ask for a keyframe — they never open sockets.
 //!
@@ -18,7 +18,7 @@
 //!
 //! # Video pipeline
 //!
-//! 1. Reassembly emits [`crate::core::reassembly::AssembledFrame`].
+//! 1. [`crate::core::fragment::Reassembly`] emits [`crate::core::fragment::MediaPacket`].
 //! 2. [`VideoFrameBuffer::push`] stores it with an arrival Instant and a
 //!    playout deadline from the jitter estimate.
 //! 3. Host timer / decoder-ready → [`VideoFrameBuffer::poll`]: release, drop
@@ -38,17 +38,15 @@
 //! ```
 //! use std::time::{Duration, Instant};
 //! use bytes::Bytes;
+//! use qrt::core::fragment::MediaPacket;
 //! use qrt::core::jitter::{VideoFrameBuffer, VideoJitterConfig, VideoPoll};
-//! use qrt::core::packet::Flags;
-//! use qrt::core::reassembly::AssembledFrame;
+//! use qrt::core::packet::MediaType;
 //!
-//! fn frame(id: u32, key: bool) -> AssembledFrame {
-//!     AssembledFrame {
-//!         stream_id: 0,
-//!         frame_id: id,
-//!         timestamp: id * 3000,
-//!         flags: Flags { key, ..Flags::default() },
-//!         first_media_seq: Some(id as u16),
+//! fn frame(id: u32, key: bool) -> MediaPacket {
+//!     MediaPacket {
+//!         id,
+//!         media_type: MediaType::Video,
+//!         is_key_frame: key,
 //!         payload: Bytes::from_static(b"v"),
 //!     }
 //! }
@@ -58,15 +56,15 @@
 //!     max_delay: Duration::from_millis(80),
 //!     ..VideoJitterConfig::default()
 //! });
-//! buf.push(frame(0, true), t0);
+//! buf.push(frame(0, true), 0, t0);
 //! // First keyframe is released immediately when decoder is ready.
 //! assert!(matches!(
 //!     buf.poll(t0, true),
-//!     VideoPoll::Decode(f) if f.frame_id == 0
+//!     VideoPoll::Decode { frame, .. } if frame.id == 0
 //! ));
 //!
-//! buf.push(frame(1, false), t0 + Duration::from_millis(10));
-//! buf.push(frame(2, false), t0 + Duration::from_millis(20));
+//! buf.push(frame(1, false), 3000, t0 + Duration::from_millis(10));
+//! buf.push(frame(2, false), 6000, t0 + Duration::from_millis(20));
 //! // Far past deadline with a newer frame waiting → drop 1 (and require key).
 //! let late = t0 + Duration::from_millis(500);
 //! assert!(matches!(
@@ -92,11 +90,11 @@ use std::{
 use bytes::Bytes;
 
 use crate::core::{
-    packet::{Flags, Header, Packet, PacketType},
-    reassembly::AssembledFrame,
+    fragment::MediaPacket,
+    packet::{Packet, Payload, Stream, StreamPacket},
 };
 
-/// Default minimum gap between [`Packet::KeyframeReq`] emissions.
+/// Default minimum gap between keyframe-request emissions.
 pub const DEFAULT_KEYFRAME_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How long after a video deadline we still wait before dropping (WebRTC ~5 ms).
@@ -143,6 +141,11 @@ pub struct VideoJitterConfig {
     /// If no decodable frame for this long while the stream is active, ask for
     /// a keyframe.
     pub stall_timeout: Duration,
+    /// Release the first keyframe as soon as it is decodable.
+    ///
+    /// Later frames still wait until `now + late_grace >= deadline`. Turn this
+    /// off when the first frame should honor [`Self::min_delay`] too.
+    pub fast_start: bool,
 }
 
 impl Default for VideoJitterConfig {
@@ -155,6 +158,7 @@ impl Default for VideoJitterConfig {
             max_frames: 32,
             keyframe_interval: DEFAULT_KEYFRAME_INTERVAL,
             stall_timeout: Duration::from_millis(500),
+            fast_start: true,
         }
     }
 }
@@ -163,19 +167,24 @@ impl Default for VideoJitterConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VideoPoll {
     /// Release this frame to the decoder now.
-    Decode(AssembledFrame),
+    Decode {
+        /// Reassembled frame.
+        frame: MediaPacket,
+        /// Capture timestamp from the packet that completed the frame.
+        timestamp: u32,
+    },
     /// Frame was too late and a newer decodable frame exists; do not decode it.
     DroppedLate {
-        /// Dropped [`AssembledFrame::frame_id`].
+        /// Dropped [`MediaPacket::id`].
         frame_id: u32,
         /// Dropped frame payload size (metrics).
         payload_len: usize,
     },
     /// Nothing ready yet (waiting for deadline, gaps, or `decoder_ready`).
     Wait,
-    /// Emit a throttled [`Packet::KeyframeReq`] for this stream.
+    /// Emit a throttled keyframe request for this stream.
     KeyframeReq {
-        /// Target [`AssembledFrame::stream_id`].
+        /// Target stream id.
         stream_id: u8,
     },
 }
@@ -183,15 +192,15 @@ pub enum VideoPoll {
 /// One assembled frame held until its playout deadline.
 #[derive(Debug, Clone)]
 struct ScheduledFrame {
-    frame: AssembledFrame,
-    arrived_at: Instant,
+    frame: MediaPacket,
+    timestamp: u32,
     deadline: Instant,
 }
 
 /// Video playout buffer with jitter-based deadlines and late-frame drop.
 ///
-/// Owns assembled frames for one [`AssembledFrame::stream_id`]. Continuous
-/// decoding requires the next `frame_id` after the last decoded frame, or a
+/// Owns assembled frames for one stream. Continuous
+/// decoding requires the next [`MediaPacket::id`] after the last decoded frame, or a
 /// keyframe (which resets the continuity cursor). Until the first keyframe,
 /// only keyframes are released (`keyframe_required`).
 ///
@@ -282,8 +291,7 @@ impl VideoFrameBuffer {
 
     /// Inserts a reassembled frame and updates the jitter estimate.
     ///
-    /// Frames for a different `stream_id` are ignored. Duplicates of an already
-    /// buffered `frame_id` are ignored.
+    /// Duplicates of an already buffered [`MediaPacket::id`] are ignored.
     ///
     /// # Examples
     ///
@@ -292,38 +300,26 @@ impl VideoFrameBuffer {
     ///
     /// use bytes::Bytes;
     /// use qrt::core::{
+    ///     fragment::MediaPacket,
     ///     jitter::{VideoFrameBuffer, VideoJitterConfig},
-    ///     packet::Flags,
-    ///     reassembly::AssembledFrame,
+    ///     packet::MediaType,
     /// };
     ///
     /// let mut buf = VideoFrameBuffer::new(0, VideoJitterConfig::default());
     /// buf.push(
-    ///     AssembledFrame {
-    ///         stream_id: 0,
-    ///         frame_id: 1,
-    ///         timestamp: 0,
-    ///         flags: Flags {
-    ///             key: true,
-    ///             ..Flags::default()
-    ///         },
-    ///         first_media_seq: None,
+    ///     MediaPacket {
+    ///         id: 1,
+    ///         media_type: MediaType::Video,
+    ///         is_key_frame: true,
     ///         payload: Bytes::from_static(b"i"),
     ///     },
+    ///     0,
     ///     Instant::now(),
     /// );
     /// assert_eq!(buf.len(), 1);
     /// ```
-    pub fn push(&mut self, frame: AssembledFrame, now: Instant) {
-        if frame.stream_id != self.stream_id {
-            return;
-        }
-
-        if self
-            .frames
-            .iter()
-            .any(|s| s.frame.frame_id == frame.frame_id)
-        {
+    pub fn push(&mut self, frame: MediaPacket, timestamp: u32, now: Instant) {
+        if self.frames.iter().any(|s| s.frame.id == frame.id) {
             return;
         }
 
@@ -342,13 +338,11 @@ impl VideoFrameBuffer {
         let deadline = now + self.target_delay();
         self.frames.push_back(ScheduledFrame {
             frame,
-            arrived_at: now,
+            timestamp,
             deadline,
         });
 
-        self.frames
-            .make_contiguous()
-            .sort_by_key(|s| s.frame.frame_id);
+        self.frames.make_contiguous().sort_by_key(|s| s.frame.id);
 
         self.trim_overflow();
     }
@@ -365,6 +359,47 @@ impl VideoFrameBuffer {
     ///   frame exists (WebRTC `DropNextDecodableTemporalUnit` idea).
     /// - Stall: no decode for [`VideoJitterConfig::stall_timeout`] while frames
     ///   are still arriving → throttled [`VideoPoll::KeyframeReq`].
+    /// - A non-zero [`VideoJitterConfig::min_delay`] holds the frame until its
+    ///   deadline. [`VideoJitterConfig::fast_start`] is the only immediate release,
+    ///   and it applies to the first keyframe.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::{Duration, Instant};
+    ///
+    /// use bytes::Bytes;
+    /// use qrt::core::{
+    ///     fragment::MediaPacket,
+    ///     jitter::{VideoFrameBuffer, VideoJitterConfig, VideoPoll},
+    ///     packet::MediaType,
+    /// };
+    ///
+    /// let t0 = Instant::now();
+    /// let mut buf = VideoFrameBuffer::new(
+    ///     0,
+    ///     VideoJitterConfig {
+    ///         fast_start: false,
+    ///         min_delay: Duration::from_millis(40),
+    ///         ..VideoJitterConfig::default()
+    ///     },
+    /// );
+    /// buf.push(
+    ///     MediaPacket {
+    ///         id: 1,
+    ///         media_type: MediaType::Video,
+    ///         is_key_frame: true,
+    ///         payload: Bytes::from_static(b"i"),
+    ///     },
+    ///     0,
+    ///     t0,
+    /// );
+    /// assert!(matches!(buf.poll(t0, true), VideoPoll::Wait));
+    /// assert!(matches!(
+    ///     buf.poll(t0 + buf.target_delay(), true),
+    ///     VideoPoll::Decode { .. }
+    /// ));
+    /// ```
     pub fn poll(&mut self, now: Instant, decoder_ready: bool) -> VideoPoll {
         if !decoder_ready {
             // Still allow stall keyframe so the sender can recover while decoder is busy.
@@ -375,52 +410,46 @@ impl VideoFrameBuffer {
             return VideoPoll::Wait;
         }
 
-        // Drop late frames when a newer frame is already buffered (skip ahead).
-        while let Some(front) = self.frames.front() {
+        // Drop one late frame when a newer frame is already buffered (skip ahead).
+        // One poll returns one drop so the host can count it.
+        if let Some(front) = self.frames.front() {
             let late = now > front.deadline + self.config.late_grace;
-            if !late || self.frames.len() < 2 {
-                break;
-            }
-
-            let dropped = self.frames.pop_front().expect("front checked");
-            // Skipping a frame breaks opaque delta chains → need a keyframe.
-            if !dropped.frame.flags.key {
+            if late && self.frames.len() >= 2 {
+                let dropped = self.frames.pop_front().expect("front checked");
+                // Skipping any frame breaks opaque delta chains → need a keyframe.
+                // Do not advance `last_decoded` for dropped keys: the decoder never
+                // saw them, so the next delta must not be treated as contiguous.
                 self.keyframe_required = true;
-            } else {
-                self.last_decoded = Some(dropped.frame.frame_id);
-            }
 
-            return VideoPoll::DroppedLate {
-                frame_id: dropped.frame.frame_id,
-                payload_len: dropped.frame.payload.len(),
-            };
+                return VideoPoll::DroppedLate {
+                    frame_id: dropped.frame.id,
+                    payload_len: dropped.frame.payload.len(),
+                };
+            }
         }
 
-        // Release the earliest decodable frame once we are at/near its deadline
-        // (or immediately for the first keyframe / zero min_delay).
-        let idx = self.frames.iter().position(|s| {
-            self.is_decodable(&s.frame) && now + self.config.late_grace >= s.deadline
-        });
+        // Deadline, plus the first keyframe when fast start is on.
+        let idx = self.frames.iter().position(|scheduled| {
+            let due = now + self.config.late_grace >= scheduled.deadline;
+            let startup =
+                self.config.fast_start && self.keyframe_required && scheduled.frame.is_key_frame;
 
-        let idx = idx.or_else(|| {
-            self.frames.iter().position(|s| {
-                self.is_decodable(&s.frame)
-                    && (self.keyframe_required
-                        || self.config.min_delay.is_zero()
-                        || now >= s.arrived_at)
-            })
+            self.is_decodable(&scheduled.frame) && (due || startup)
         });
 
         if let Some(i) = idx {
             let scheduled = self.frames.remove(i).expect("index from position");
             self.on_decoded(&scheduled.frame, now);
-            return VideoPoll::Decode(scheduled.frame);
+            return VideoPoll::Decode {
+                frame: scheduled.frame,
+                timestamp: scheduled.timestamp,
+            };
         }
 
-        if !self.frames.iter().any(|s| self.is_decodable(&s.frame)) {
-            if let Some(req) = self.try_keyframe_req(now) {
-                return req;
-            }
+        if !self.frames.iter().any(|s| self.is_decodable(&s.frame))
+            && let Some(req) = self.try_keyframe_req(now)
+        {
+            return req;
         }
 
         if let Some(req) = self.maybe_keyframe_on_stall(now) {
@@ -430,37 +459,65 @@ impl VideoFrameBuffer {
         VideoPoll::Wait
     }
 
-    /// Builds an owned [`Packet::KeyframeReq`] for this stream.
+    /// Earliest playout wake time while frames are buffered.
+    ///
+    /// Used by the session I/O loop to `sleep_until` instead of blind polling.
+    /// `None` when the buffer is empty (stall PLI is checked on UDP / NACK ticks
+    /// via [`Self::poll`]).
+    pub fn next_wake_at(&self, now: Instant) -> Option<Instant> {
+        if self.config.fast_start
+            && self.keyframe_required
+            && self
+                .frames
+                .iter()
+                .any(|scheduled| scheduled.frame.is_key_frame)
+        {
+            return Some(now);
+        }
+
+        let wake = self
+            .frames
+            .iter()
+            .map(|scheduled| {
+                // [`Self::poll`] releases when `now + late_grace >= deadline`.
+                scheduled
+                    .deadline
+                    .checked_sub(self.config.late_grace)
+                    .unwrap_or(scheduled.deadline)
+            })
+            .min()?;
+
+        Some(if wake < now { now } else { wake })
+    }
+
+    /// Builds a keyframe-request [`Packet`] for this stream.
     ///
     /// # Examples
     ///
     /// ```
     /// use qrt::core::{
     ///     jitter::{VideoFrameBuffer, VideoJitterConfig},
-    ///     packet::Packet,
+    ///     packet::{Packet, Payload, StreamPacket},
     /// };
     ///
     /// let buf = VideoFrameBuffer::new(3, VideoJitterConfig::default());
-    /// match buf.keyframe_packet(50) {
-    ///     Packet::KeyframeReq { stream_id, .. } => assert_eq!(stream_id, 3),
-    ///     _ => panic!("expected KeyframeReq"),
+    /// match buf.keyframe_packet().payload {
+    ///     Payload::Stream(stream) => {
+    ///         assert_eq!(stream.id, 3);
+    ///         assert!(matches!(stream.packet, StreamPacket::KeyFrameRequest));
+    ///     }
+    ///     _ => panic!("expected keyframe request"),
     /// }
     /// ```
-    pub fn keyframe_packet(&self, ttl_ms: u16) -> Packet<'static> {
-        Packet::KeyframeReq {
-            header: Header {
-                packet_type: PacketType::KeyframeReq,
-                flags: Flags::default(),
-                stream_id: self.stream_id,
-                media_seq: 0,
-                transport_seq: 0,
-                frame_id: 0,
-                frag_index: 0,
-                frag_count: 1,
-                timestamp: 0,
-                ttl_ms,
-            },
-            stream_id: self.stream_id,
+    pub fn keyframe_packet(&self) -> Packet {
+        Packet {
+            sequence: 0,
+            timestamp: 0,
+            payload: Payload::Stream(Stream {
+                id: self.stream_id,
+                idx: 0,
+                packet: StreamPacket::KeyFrameRequest,
+            }),
         }
     }
 
@@ -472,25 +529,25 @@ impl VideoFrameBuffer {
         self.last_decoded_at = Some(now);
     }
 
-    fn is_decodable(&self, frame: &AssembledFrame) -> bool {
+    fn is_decodable(&self, frame: &MediaPacket) -> bool {
         if self.keyframe_required {
-            return frame.flags.key;
+            return frame.is_key_frame;
         }
 
-        if frame.flags.key {
+        if frame.is_key_frame {
             return true;
         }
 
         match self.last_decoded {
-            None => frame.flags.key,
-            Some(id) => frame.frame_id == id.wrapping_add(1) || frame.flags.key,
+            None => frame.is_key_frame,
+            Some(id) => frame.id == id.wrapping_add(1) || frame.is_key_frame,
         }
     }
 
-    fn on_decoded(&mut self, frame: &AssembledFrame, now: Instant) {
-        self.last_decoded = Some(frame.frame_id);
+    fn on_decoded(&mut self, frame: &MediaPacket, now: Instant) {
+        self.last_decoded = Some(frame.id);
         self.last_decoded_at = Some(now);
-        if frame.flags.key {
+        if frame.is_key_frame {
             self.keyframe_required = false;
         }
     }
@@ -501,7 +558,7 @@ impl VideoFrameBuffer {
             let drop_at = self
                 .frames
                 .iter()
-                .position(|s| !s.frame.flags.key)
+                .position(|s| !s.frame.is_key_frame)
                 .unwrap_or(0);
             self.frames.remove(drop_at);
         }
@@ -533,10 +590,10 @@ impl VideoFrameBuffer {
     }
 
     fn try_keyframe_req(&mut self, now: Instant) -> Option<VideoPoll> {
-        if let Some(last) = self.last_keyframe_req {
-            if now.saturating_duration_since(last) < self.config.keyframe_interval {
-                return None;
-            }
+        if let Some(last) = self.last_keyframe_req
+            && now.saturating_duration_since(last) < self.config.keyframe_interval
+        {
+            return None;
         }
 
         self.last_keyframe_req = Some(now);
@@ -659,11 +716,22 @@ pub struct AudioTick {
 ///     payload: Bytes::from_static(b"a"),
 ///     arrived_at: t0,
 /// });
-/// let tick = neteq.get_decision(t0 + Duration::from_millis(10));
+///
+/// // Target delay is 80 ms, so a tick at 10 ms is still buffering.
+/// assert!(neteq.get_decision(t0 + Duration::from_millis(10)).is_none());
+///
+/// let tick = neteq
+///     .get_decision(t0 + Duration::from_millis(80))
+///     .expect("playout started");
 /// assert!(tick.packet.is_some());
 /// assert_ne!(tick.decision, AudioDecision::Expand);
 ///
-/// let plc = neteq.get_decision(t0 + Duration::from_millis(20));
+/// // The same instant is not a second tick.
+/// assert!(neteq.get_decision(t0 + Duration::from_millis(80)).is_none());
+///
+/// let plc = neteq
+///     .get_decision(t0 + Duration::from_millis(90))
+///     .expect("conceal tick");
 /// assert_eq!(plc.decision, AudioDecision::Expand);
 /// assert!(plc.packet.is_none());
 /// ```
@@ -675,6 +743,8 @@ pub struct AudioNetEq {
     target: Duration,
     arrival_ewma: Duration,
     last_arrival: Option<Instant>,
+    /// When the next decision may be produced. `None` until playout starts.
+    next_playout: Option<Instant>,
 }
 
 impl AudioNetEq {
@@ -698,6 +768,7 @@ impl AudioNetEq {
             packets: VecDeque::new(),
             target,
             last_arrival: None,
+            next_playout: None,
         }
     }
 
@@ -774,34 +845,68 @@ impl AudioNetEq {
         }
     }
 
-    /// Produces the next ~10 ms decision and optionally consumes one packet.
+    /// When [`Self::get_decision`] will next return a tick.
+    ///
+    /// Before playout starts, this is the oldest packet's arrival plus the
+    /// target delay. After that, it is one [`AudioJitterConfig::tick`] past
+    /// the previous decision. `None` when the buffer is empty and playout has
+    /// not started.
+    pub fn next_playout_at(&self) -> Option<Instant> {
+        if let Some(at) = self.next_playout {
+            return Some(at);
+        }
+
+        let oldest = self.packets.front()?.arrived_at;
+
+        Some(oldest + self.clamped_target())
+    }
+
+    /// Produces at most one decision when `now` has reached the next tick.
+    ///
+    /// `None` means wait. Playout starts once buffered audio reaches the target
+    /// delay, or the oldest packet has waited that long. A later call at the
+    /// same `now` returns `None`.
     ///
     /// # Notes
     ///
-    /// - Empty buffer → [`AudioDecision::Expand`] (host runs PLC).
+    /// - Empty buffer on a due tick → [`AudioDecision::Expand`]. The engine
+    ///   surfaces that as [`crate::engine::EngineEvent::Conceal`], not as a
+    ///   frame. The host runs PLC.
     /// - `buffer_delay > 1.2 × target` → [`AudioDecision::Accelerate`].
     /// - `buffer_delay < 0.8 × target` with packets →
     ///   [`AudioDecision::PreemptiveExpand`].
     /// - Otherwise → [`AudioDecision::Normal`].
-    pub fn get_decision(&mut self, _now: Instant) -> AudioTick {
-        let buffer_delay = self.config.tick.saturating_mul(self.packets.len() as u32);
-        let target = self
-            .target
-            .max(self.config.min_delay)
-            .min(self.config.max_delay);
+    pub fn get_decision(&mut self, now: Instant) -> Option<AudioTick> {
+        if let Some(at) = self.next_playout {
+            if now < at {
+                return None;
+            }
+        } else if self.packets.is_empty() {
+            return None;
+        } else {
+            let oldest = self.packets.front().expect("buffer checked").arrived_at;
+            let waited = now.saturating_duration_since(oldest);
+            if self.buffer_delay() < self.clamped_target() && waited < self.clamped_target() {
+                return None;
+            }
+        }
+
+        let target = self.clamped_target();
+        let buffer_delay = self.buffer_delay();
+        let step = self.config.tick.max(Duration::from_nanos(1));
+        self.next_playout = Some(now + step);
 
         if self.packets.is_empty() {
-            return AudioTick {
+            return Some(AudioTick {
                 decision: AudioDecision::Expand,
                 packet: None,
                 target_delay: target,
                 buffer_delay,
-            };
+            });
         }
 
         let high = Duration::from_secs_f64(target.as_secs_f64() * 1.2);
         let low = Duration::from_secs_f64(target.as_secs_f64() * 0.8);
-
         let decision = if buffer_delay > high {
             AudioDecision::Accelerate
         } else if buffer_delay < low {
@@ -809,13 +914,23 @@ impl AudioNetEq {
         } else {
             AudioDecision::Normal
         };
-
         let packet = self.packets.pop_front();
-        AudioTick {
+
+        Some(AudioTick {
             decision,
             packet,
             target_delay: target,
-            buffer_delay: self.config.tick.saturating_mul(self.packets.len() as u32),
-        }
+            buffer_delay: self.buffer_delay(),
+        })
+    }
+
+    fn clamped_target(&self) -> Duration {
+        self.target
+            .max(self.config.min_delay)
+            .min(self.config.max_delay)
+    }
+
+    fn buffer_delay(&self) -> Duration {
+        self.config.tick.saturating_mul(self.packets.len() as u32)
     }
 }

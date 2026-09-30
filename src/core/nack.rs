@@ -1,7 +1,7 @@
 //! Receive-side NACK list.
 //!
-//! Tracks missing [`Header::media_seq`] gaps and periodically emits
-//! [`Packet::Nack`] bodies (RFC 4585 Generic NACK role). Aligns with WebRTC
+//! Tracks missing media-sequence gaps and periodically emits
+//! [`crate::core::packet::NackPacket`] bodies (RFC 4585 Generic NACK role). Aligns with WebRTC
 //! `NackRequester` (`modules/video_coding/nack_requester.*`): ~20ms process
 //! cadence, retransmit spacing ≥ RTT, list cap → keyframe, skip sequences that
 //! arrived (including FEC-recovered media).
@@ -18,10 +18,7 @@
 //! ```
 //! use std::time::{Duration, Instant};
 //!
-//! use qrt::core::{
-//!     nack::{NackConfig, NackRequester},
-//!     packet::Packet,
-//! };
+//! use qrt::core::nack::{NackConfig, NackRequester};
 //!
 //! let t0 = Instant::now();
 //! let mut nack = NackRequester::new(1, NackConfig::default());
@@ -35,10 +32,10 @@
 //!
 //! let batch = nack.process(t0);
 //! assert!(!batch.entries.is_empty());
-//! let seqs: Vec<u16> = batch
+//! let seqs: Vec<u32> = batch
 //!     .entries
 //!     .iter()
-//!     .flat_map(|(b, blp)| Packet::nack_missing_seqs(*b, *blp))
+//!     .flat_map(|entry| entry.sequences())
 //!     .collect();
 //! assert!(seqs.contains(&11) && seqs.contains(&12));
 //!
@@ -60,7 +57,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::core::packet::{Flags, Header, Packet, PacketType};
+use crate::core::packet::{NackPacket, Packet, Payload, Stream, StreamPacket};
 
 /// Default periodic process interval (WebRTC `NackPeriodicProcessor` ~20ms).
 pub const DEFAULT_PROCESS_INTERVAL: Duration = Duration::from_millis(20);
@@ -83,7 +80,7 @@ pub struct NackConfig {
     /// Give up on a sequence after this many NACK transmissions.
     pub max_retries: u32,
     /// Clear pending entries older than this many sequence numbers behind newest.
-    pub max_age_seqs: u16,
+    pub max_age_seqs: u32,
 }
 
 impl Default for NackConfig {
@@ -117,53 +114,55 @@ pub struct OnReceivedResult {
 /// Batch produced by [`NackRequester::process`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NackBatch {
-    /// Packed `(base_seq, blp)` ready for [`Packet::Nack`].
-    pub entries: Vec<(u16, u16)>,
-    /// Send a [`Packet::KeyframeReq`] (list overflow or exhausted retries storm).
+    /// Packed NACK bodies ready to send.
+    pub entries: Vec<NackPacket>,
+    /// Send a keyframe request (list overflow or exhausted retries storm).
     pub ask_keyframe: bool,
 }
 
 impl NackBatch {
-    /// Builds owned [`Packet::Nack`] views (header `transport_seq` left at 0).
+    /// Builds NACK datagrams. [`Packet::sequence`] is left at 0 for the pacer to stamp.
     ///
     /// # Examples
     ///
     /// ```
-    /// use qrt::core::{nack::NackBatch, packet::Packet};
+    /// use qrt::core::{
+    ///     nack::NackBatch,
+    ///     packet::{NackPacket, Packet, Payload, StreamPacket},
+    /// };
     ///
     /// let batch = NackBatch {
-    ///     entries: vec![(10, 0b1)],
+    ///     entries: vec![NackPacket {
+    ///         base_media_sequence: 10,
+    ///         blp: 0b1,
+    ///     }],
     ///     ask_keyframe: false,
     /// };
-    /// let pkts = batch.to_packets(1, 50);
+    /// let pkts = batch.to_packets(1);
     /// assert_eq!(pkts.len(), 1);
-    /// match &pkts[0] {
-    ///     Packet::Nack { base_seq, blp, .. } => {
-    ///         assert_eq!(*base_seq, 10);
-    ///         assert_eq!(*blp, 0b1);
-    ///     }
+    /// match &pkts[0].payload {
+    ///     Payload::Stream(stream) => match &stream.packet {
+    ///         StreamPacket::Nack(nack) => {
+    ///             assert_eq!(stream.id, 1);
+    ///             assert_eq!(nack.base_media_sequence, 10);
+    ///             assert_eq!(nack.blp, 0b1);
+    ///         }
+    ///         _ => panic!("expected Nack"),
+    ///     },
     ///     _ => panic!("expected Nack"),
     /// }
     /// ```
-    pub fn to_packets(&self, stream_id: u8, ttl_ms: u16) -> Vec<Packet<'static>> {
+    pub fn to_packets(&self, stream_id: u8) -> Vec<Packet> {
         self.entries
             .iter()
-            .map(|&(base_seq, blp)| Packet::Nack {
-                header: Header {
-                    packet_type: PacketType::Nack,
-                    flags: Flags::default(),
-                    stream_id,
-                    media_seq: 0,
-                    transport_seq: 0,
-                    frame_id: 0,
-                    frag_index: 0,
-                    frag_count: 1,
-                    timestamp: 0,
-                    ttl_ms,
-                },
-                base_seq,
-                blp,
-                frame_id: None,
+            .map(|nack| Packet {
+                sequence: 0,
+                timestamp: 0,
+                payload: Payload::Stream(Stream {
+                    id: stream_id,
+                    idx: 0,
+                    packet: StreamPacket::Nack(nack.clone()),
+                }),
             })
             .collect()
     }
@@ -175,12 +174,12 @@ pub struct NackRequester {
     stream_id: u8,
     config: NackConfig,
     rtt: Duration,
-    newest: Option<u16>,
-    pending: BTreeMap<u16, NackInfo>,
+    newest: Option<u32>,
+    pending: BTreeMap<u32, NackInfo>,
 }
 
 impl NackRequester {
-    /// Creates a requester for one [`Header::stream_id`].
+    /// Creates a requester for one stream id.
     ///
     /// # Examples
     ///
@@ -252,8 +251,22 @@ impl NackRequester {
     /// let r = nack.on_received(10, t0); // gaps 1..9 exceed max_list_size
     /// assert!(r.ask_keyframe);
     /// assert_eq!(nack.pending_count(), 0);
+    ///
+    /// // A jump near half the sequence space never walks the hole.
+    /// let mut wide = NackRequester::new(0, NackConfig::default());
+    /// wide.on_received(0, t0);
+    /// let jumped = wide.on_received(0x4000_0000, t0);
+    /// assert!(jumped.ask_keyframe);
+    /// assert_eq!(wide.pending_count(), 0);
+    ///
+    /// // Wrapping the u32 space still records only the real hole.
+    /// let mut wrapped = NackRequester::new(0, NackConfig::default());
+    /// wrapped.on_received(u32::MAX - 1, t0);
+    /// let across = wrapped.on_received(1, t0);
+    /// assert!(!across.ask_keyframe);
+    /// assert_eq!(wrapped.pending_count(), 2);
     /// ```
-    pub fn on_received(&mut self, media_seq: u16, now: Instant) -> OnReceivedResult {
+    pub fn on_received(&mut self, media_seq: u32, now: Instant) -> OnReceivedResult {
         let mut result = OnReceivedResult::default();
 
         if self.pending.remove(&media_seq).is_some() {
@@ -265,12 +278,23 @@ impl NackRequester {
                 self.newest = Some(media_seq);
             }
             Some(newest) if seq_ahead(media_seq, newest) => {
-                let mut s = newest.wrapping_add(1);
-                while s != media_seq {
-                    self.insert_gap(s, now);
-                    s = s.wrapping_add(1);
+                let missing = media_seq.wrapping_sub(newest) - 1;
+                let list_cap = u32::try_from(self.config.max_list_size).unwrap_or(u32::MAX);
+
+                // A huge hole would walk up to 2^31 sequence numbers before the
+                // list cap was checked. Reset and ask for a keyframe instead.
+                if missing > list_cap || missing > self.config.max_age_seqs {
+                    self.pending.clear();
+                    self.newest = Some(media_seq);
+                    result.ask_keyframe = true;
+                } else {
+                    let mut seq = newest.wrapping_add(1);
+                    while seq != media_seq {
+                        self.insert_gap(seq, now);
+                        seq = seq.wrapping_add(1);
+                    }
+                    self.newest = Some(media_seq);
                 }
-                self.newest = Some(media_seq);
             }
             Some(_) => {
                 // Reordered / duplicate behind newest — already cleared pending.
@@ -287,7 +311,7 @@ impl NackRequester {
 
     /// Drops all pending NACK entries with `seq` not ahead of `media_seq`
     /// (decoder / reassembly advanced past them).
-    pub fn clear_up_to(&mut self, media_seq: u16) {
+    pub fn clear_up_to(&mut self, media_seq: u32) {
         self.pending.retain(|&seq, _| seq_ahead(seq, media_seq));
     }
 
@@ -307,10 +331,7 @@ impl NackRequester {
     /// ```
     /// use std::time::{Duration, Instant};
     ///
-    /// use qrt::core::{
-    ///     nack::{NackConfig, NackRequester},
-    ///     packet::Packet,
-    /// };
+    /// use qrt::core::nack::{NackConfig, NackRequester};
     ///
     /// let t0 = Instant::now();
     /// let mut nack = NackRequester::new(0, NackConfig::default());
@@ -319,10 +340,7 @@ impl NackRequester {
     /// nack.on_received(3, t0); // missing 2
     ///
     /// let first = nack.process(t0);
-    /// assert_eq!(
-    ///     Packet::nack_missing_seqs(first.entries[0].0, first.entries[0].1),
-    ///     vec![2]
-    /// );
+    /// assert_eq!(first.entries[0].sequences(), vec![2]);
     /// assert!(
     ///     nack.process(t0 + Duration::from_millis(10))
     ///         .entries
@@ -338,8 +356,8 @@ impl NackRequester {
         let lifetime = self.config.packet_lifetime;
         let rtt = self.rtt;
         let max_retries = self.config.max_retries;
-        let mut to_send: Vec<u16> = Vec::new();
-        let mut remove: Vec<u16> = Vec::new();
+        let mut to_send: Vec<u32> = Vec::new();
+        let mut remove: Vec<u32> = Vec::new();
 
         // Drop seqs too far behind newest.
         if let Some(newest) = self.newest {
@@ -379,12 +397,12 @@ impl NackRequester {
             self.pending.remove(&seq);
         }
 
-        batch.entries = Packet::nack_pack_seqs(to_send);
+        batch.entries = NackPacket::pack(to_send);
 
         batch
     }
 
-    fn insert_gap(&mut self, seq: u16, now: Instant) {
+    fn insert_gap(&mut self, seq: u32, now: Instant) {
         self.pending.entry(seq).or_insert_with(|| NackInfo {
             created_at: now,
             send_at: now + self.config.nack_delay,
@@ -393,8 +411,8 @@ impl NackRequester {
     }
 }
 
-/// Same wrapping rule as [`Header::seq_ahead`]: `a` is strictly ahead of `b`.
-fn seq_ahead(a: u16, b: u16) -> bool {
+/// `a` is strictly ahead of `b` on the wrapping `u32` media sequence.
+fn seq_ahead(a: u32, b: u32) -> bool {
     let diff = a.wrapping_sub(b);
-    diff != 0 && diff < 0x8000
+    diff != 0 && diff < 0x8000_0000
 }

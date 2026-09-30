@@ -1,7 +1,7 @@
 //! Transport-wide arrival feedback, TWCC / transport-cc role.
 //!
-//! Receiver records every datagram by [`Header::transport_seq`] and periodically
-//! emits [`Packet::ArrivalFeedback`]. Sender matches feedback against a local
+//! Receiver records every datagram by [`crate::core::packet::Packet::sequence`] and periodically
+//! emits [`crate::core::packet::Payload::ArrivalFeedback`]. Sender matches feedback against a local
 //! send history into [`TransportPacketsFeedback`] for BWE (Phase 6).
 //!
 //! Aligns with WebRTC
@@ -70,12 +70,13 @@ use std::{
 
 use bytes::Bytes;
 
-use crate::core::packet::{
-    ARRIVAL_RECV_DELTA_TICK, Flags, HEADER_SIZE, Header, Packet, PacketType,
-};
+use crate::core::packet::{ArrivalFeedbackPacket, Packet, Payload};
 
-/// Bits covered by one [`Packet::ArrivalFeedback`] mask.
-pub const ARRIVAL_MASK_BITS: u16 = 64;
+/// Receive-time delta tick (WebRTC transport-cc uses 250µs).
+const ARRIVAL_RECV_DELTA_TICK: Duration = Duration::from_micros(250);
+
+/// Bits covered by one arrival-feedback mask.
+pub const ARRIVAL_MASK_BITS: u32 = 64;
 
 /// Default feedback interval (WebRTC often ~100ms, clamped 50–250ms).
 pub const DEFAULT_FEEDBACK_INTERVAL: Duration = Duration::from_millis(100);
@@ -107,37 +108,31 @@ impl Default for FeedbackConfig {
 /// Owned ArrivalFeedback ready to encode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArrivalFeedbackOwned {
-    /// Common header (`packet_type == ArrivalFeedback`).
-    pub header: Header,
     /// First transport sequence in the mask window.
-    pub first_seq: u16,
+    pub first_seq: u32,
     /// Bit `i` set ⇒ `first_seq.wrapping_add(i)` received.
     pub received_mask: u64,
     /// Recv deltas in 250µs ticks (one per set bit, low→high).
     pub recv_deltas_250us: Vec<u16>,
-    /// Big-endian encoding of [`Self::recv_deltas_250us`].
-    pub recv_delta_bytes: Bytes,
 }
 
 impl ArrivalFeedbackOwned {
-    /// Borrow as [`Packet::ArrivalFeedback`].
-    pub fn as_packet(&self) -> Packet<'_> {
-        Packet::ArrivalFeedback {
-            header: self.header.clone(),
-            first_seq: self.first_seq,
-            received_mask: self.received_mask,
-            recv_delta_bytes: &self.recv_delta_bytes,
+    /// Build the datagram. [`Packet::sequence`] stays 0 until the pacer stamps it.
+    pub fn as_packet(&self) -> Packet {
+        Packet {
+            sequence: 0,
+            timestamp: 0,
+            payload: Payload::ArrivalFeedback(ArrivalFeedbackPacket {
+                range: self.first_seq..self.first_seq.wrapping_add(ARRIVAL_MASK_BITS),
+                received_mask: self.received_mask,
+                received: self.recv_deltas_250us.clone(),
+            }),
         }
     }
 
     /// Encode to a full UDP datagram.
     pub fn to_wire(&self) -> Bytes {
-        let pkt = self.as_packet();
-        let mut buf = vec![0u8; pkt.encoded_len()];
-
-        pkt.encode(&mut buf);
-
-        Bytes::from(buf)
+        self.as_packet().into_bytes()
     }
 }
 
@@ -146,12 +141,12 @@ impl ArrivalFeedbackOwned {
 pub struct ArrivalRecorder {
     config: FeedbackConfig,
     /// transport_seq → receive Instant.
-    received: BTreeMap<u16, Instant>,
+    received: BTreeMap<u32, Instant>,
     /// Next window base to report (wrapping).
-    next_base: Option<u16>,
+    next_base: Option<u32>,
     last_emit: Option<Instant>,
     /// Newest transport_seq seen (for wrapping-aware prune).
-    newest: Option<u16>,
+    newest: Option<u32>,
 }
 
 impl ArrivalRecorder {
@@ -185,7 +180,7 @@ impl ArrivalRecorder {
     }
 
     /// Records that `transport_seq` arrived at `now` (size unused for emit).
-    pub fn on_packet(&mut self, transport_seq: u16, now: Instant, _size_bytes: usize) {
+    pub fn on_packet(&mut self, transport_seq: u32, now: Instant, _size_bytes: usize) {
         self.received.entry(transport_seq).or_insert(now);
         self.newest = Some(match self.newest {
             Some(n) if seq_ahead(transport_seq, n) => transport_seq,
@@ -200,14 +195,28 @@ impl ArrivalRecorder {
         self.prune(now);
     }
 
+    /// Earliest instant when [`Self::poll`] should be tried again.
+    ///
+    /// `None` when there is nothing pending to report (idle until the next
+    /// [`Self::on_packet`]).
+    pub fn next_poll_at(&self, now: Instant) -> Option<Instant> {
+        if self.received.is_empty() && self.next_base.is_none() {
+            return None;
+        }
+        Some(match self.last_emit {
+            None => now,
+            Some(last) => last + self.config.interval,
+        })
+    }
+
     /// Emits feedback when the interval elapsed and there is something to report.
     ///
     /// Returns `None` if not due or the next 64-seq window has no activity yet.
     pub fn poll(&mut self, now: Instant) -> Option<ArrivalFeedbackOwned> {
-        if let Some(last) = self.last_emit {
-            if now.saturating_duration_since(last) < self.config.interval {
-                return None;
-            }
+        if let Some(last) = self.last_emit
+            && now.saturating_duration_since(last) < self.config.interval
+        {
+            return None;
         }
 
         self.build_window(now)
@@ -228,9 +237,7 @@ impl ArrivalRecorder {
         let window_has_recv =
             (0..ARRIVAL_MASK_BITS).any(|i| self.received.contains_key(&base.wrapping_add(i)));
         if !window_has_recv {
-            let Some((&oldest, _)) = self.received.iter().next() else {
-                return None;
-            };
+            let (&oldest, _) = self.received.iter().next()?;
 
             base = oldest;
         }
@@ -264,25 +271,10 @@ impl ArrivalRecorder {
             prev = t;
         }
 
-        let delta_bytes = Packet::encode_arrival_recv_deltas(&deltas);
         let owned = ArrivalFeedbackOwned {
-            header: Header {
-                packet_type: PacketType::ArrivalFeedback,
-                flags: Flags::default(),
-                stream_id: 0,
-                media_seq: 0,
-                transport_seq: 0,
-                frame_id: 0,
-                frag_index: 0,
-                frag_count: 1,
-                // Absolute base time unused; relative deltas feed delay BWE.
-                timestamp: 0,
-                ttl_ms: self.config.feedback_ttl_ms,
-            },
             first_seq: base,
             received_mask: mask,
             recv_deltas_250us: deltas,
-            recv_delta_bytes: Bytes::from(delta_bytes),
         };
 
         self.next_base = Some(base.wrapping_add(ARRIVAL_MASK_BITS));
@@ -302,7 +294,7 @@ impl ArrivalRecorder {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SentPacket {
     /// Connection-wide transport sequence.
-    pub transport_seq: u16,
+    pub transport_seq: u32,
     /// Local send Instant.
     pub send_time: Instant,
     /// On-wire size in bytes.
@@ -315,7 +307,7 @@ pub struct SentPacket {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PacketResult {
     /// Transport sequence.
-    pub transport_seq: u16,
+    pub transport_seq: u32,
     /// Local send time.
     pub send_time: Instant,
     /// On-wire size.
@@ -350,8 +342,8 @@ pub struct FeedbackAdapter {
     history: VecDeque<SentPacket>,
     /// Highest transport_seq whose feedback window has been fully applied.
     /// In-flight = sent with seq ahead of this that are not yet acked.
-    last_ack_advance: Option<u16>,
-    acked: BTreeMap<u16, Instant>,
+    last_ack_advance: Option<u32>,
+    acked: BTreeMap<u32, Instant>,
 }
 
 impl FeedbackAdapter {
@@ -376,7 +368,7 @@ impl FeedbackAdapter {
     /// Records a datagram at true send time (after `transport_seq` assignment).
     pub fn on_sent(
         &mut self,
-        transport_seq: u16,
+        transport_seq: u32,
         send_time: Instant,
         size_bytes: usize,
         audio: bool,
@@ -410,7 +402,7 @@ impl FeedbackAdapter {
     /// See the [module-level example](crate::core::feedback).
     pub fn on_feedback(
         &mut self,
-        first_seq: u16,
+        first_seq: u32,
         received_mask: u64,
         recv_deltas_250us: &[u16],
         feedback_time: Instant,
@@ -418,8 +410,8 @@ impl FeedbackAdapter {
         self.cull(feedback_time);
 
         // Build receive times for set bits (low→high).
-        let mut recv_times: BTreeMap<u16, Instant> = BTreeMap::new();
-        let set_bits: Vec<u16> = (0..ARRIVAL_MASK_BITS)
+        let mut recv_times: BTreeMap<u32, Instant> = BTreeMap::new();
+        let set_bits: Vec<u32> = (0..ARRIVAL_MASK_BITS)
             .filter(|&i| received_mask & (1u64 << i) != 0)
             .collect();
 
@@ -484,19 +476,16 @@ impl FeedbackAdapter {
     /// Convenience: decode an ArrivalFeedback packet and match it.
     pub fn on_feedback_packet(
         &mut self,
-        packet: &Packet<'_>,
+        packet: &Packet,
         feedback_time: Instant,
     ) -> Option<TransportPacketsFeedback> {
-        match packet {
-            Packet::ArrivalFeedback {
-                first_seq,
-                received_mask,
-                recv_delta_bytes,
-                ..
-            } => {
-                let deltas = Packet::parse_arrival_recv_deltas(recv_delta_bytes);
-                Some(self.on_feedback(*first_seq, *received_mask, &deltas, feedback_time))
-            }
+        match &packet.payload {
+            Payload::ArrivalFeedback(feedback) => Some(self.on_feedback(
+                feedback.range.start,
+                feedback.received_mask,
+                &feedback.received,
+                feedback_time,
+            )),
             _ => None,
         }
     }
@@ -527,10 +516,10 @@ impl FeedbackAdapter {
     }
 }
 
-/// Assigns monotonically increasing [`Header::transport_seq`] values.
+/// Assigns monotonically increasing [`Packet::sequence`] values.
 #[derive(Debug, Clone, Default)]
 pub struct TransportSeqAssigner {
-    next: u16,
+    next: u32,
 }
 
 impl TransportSeqAssigner {
@@ -541,37 +530,37 @@ impl TransportSeqAssigner {
 
     /// Returns the next transport sequence and advances the counter.
     ///
+    /// Named `allocate` so it is not [`Iterator::next`].
+    ///
     /// # Examples
     ///
     /// ```
     /// use qrt::core::feedback::TransportSeqAssigner;
     /// let mut a = TransportSeqAssigner::new();
-    /// assert_eq!(a.next(), 0);
-    /// assert_eq!(a.next(), 1);
+    /// assert_eq!(a.allocate(), 0);
+    /// assert_eq!(a.allocate(), 1);
     /// ```
-    pub fn next(&mut self) -> u16 {
+    pub fn allocate(&mut self) -> u32 {
         let s = self.next;
         self.next = self.next.wrapping_add(1);
 
         s
     }
 
-    /// Writes `transport_seq` into the first [`HEADER_SIZE`] bytes of `wire`.
-    pub fn stamp(&mut self, wire: &mut [u8]) -> Option<u16> {
-        if wire.len() < HEADER_SIZE {
+    /// Writes the next transport sequence into bytes 3..7 (`type` + `size` precede it).
+    pub fn stamp(&mut self, wire: &mut [u8]) -> Option<u32> {
+        if wire.len() < 7 {
             return None;
         }
 
-        let mut header = Header::decode(wire).ok()?;
-        let seq = self.next();
-        header.transport_seq = seq;
-        header.encode(wire);
+        let seq = self.allocate();
+        wire[3..7].copy_from_slice(&seq.to_be_bytes());
 
         Some(seq)
     }
 }
 
-fn seq_ahead(a: u16, b: u16) -> bool {
+fn seq_ahead(a: u32, b: u32) -> bool {
     let diff = a.wrapping_sub(b);
-    diff != 0 && diff < 0x8000
+    diff != 0 && diff < 0x8000_0000
 }

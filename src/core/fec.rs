@@ -1,38 +1,29 @@
 //! XOR forward-error correction, WebRTC ULPFEC / FlexFEC style.
 //!
-//! Generates [`crate::core::packet::Packet::Fec`] parity over **full Media datagrams**
-//! (fixed [`HEADER_SIZE`] header + body) and recovers a missing media packet
-//! when a FEC row covers **exactly one** loss. Multiple rows with different
-//! masks can repair more than one loss across a block.
+//! Builds parity over **full media datagrams** and recovers a missing media
+//! packet when a FEC row covers **exactly one** loss. Multiple rows with
+//! different masks can repair more than one loss across a block.
 //!
 //! Aligns with WebRTC `ForwardErrorCorrection` / `UlpfecGenerator` /
-//! `UlpfecReceiver` (`modules/rtp_rtcp/source/forward_error_correction.*`),
-//! but uses qrt's compact [`Packet::Fec`] body instead of RTP RED / FlexFEC
-//! headers. Mask tables are a simple round-robin partition (not the full
-//! bursty/random private tables); that is enough for single- and multi-row
-//! parity at `kUlpfecMaxMediaPackets = 48`.
+//! `UlpfecReceiver` (`modules/rtp_rtcp/source/forward_error_correction.*`).
+//! Mask tables are a simple round-robin partition (not the full bursty/random
+//! private tables); that is enough for single- and multi-row parity at
+//! `kUlpfecMaxMediaPackets = 48`.
 //!
-//! # Wire reminder
-//!
-//! ```text
-//! Packet::Fec body:
-//!   seq_base:u16 | mask:u64 | length_xor:u16 | xor_payload...
-//! ```
-//!
-//! Bit `i` in `mask` protects media with
-//! [`Header::media_seq`] `seq_base.wrapping_add(i)`. `length_xor` is the XOR of
-//! each protected datagram's length as `u16`. `xor_payload` is the XOR of those
-//! datagrams, each zero-padded to `xor_payload.len()`.
+//! Rows are [`FecPacketOwned`] values, not a [`crate::core::packet::Packet`]
+//! variant. Bit `i` in `mask` protects media sequence
+//! `seq_base.wrapping_add(i)`. `length_xor` is the XOR of each protected
+//! datagram's length as `u16`. `payload` is the XOR of those datagrams, each
+//! zero-padded to `payload.len()`.
 //!
 //! # Pipeline
 //!
 //! **Send**
 //!
 //! 1. After encoding each media UDP datagram, [`FecGenerator::push`] the wire
-//!    bytes (same bytes that go on the socket / into history).
+//!    bytes.
 //! 2. [`FecGenerator::flush`] (end of frame / protection window) →
-//!    [`FecPacketOwned`] rows →enqueue at video priority (`retrans = false`).
-//! 3. Assign [`Header::transport_seq`] at pacer egress.
+//!    [`FecPacketOwned`] rows.
 //!
 //! **Receive**
 //!
@@ -50,28 +41,28 @@
 //! use bytes::Bytes;
 //! use qrt::core::{
 //!     fec::{FecGenerator, FecProtectionParams, FecReceiver},
-//!     packet::{Flags, HEADER_SIZE, Header, Packet, PacketType},
+//!     packet::{MediaFragmentPacket, MediaType, Packet, Payload, Stream, StreamPacket},
 //! };
 //!
-//! fn media_wire(seq: u16, payload: &[u8]) -> Bytes {
-//!     let pkt = Packet::Media {
-//!         header: Header {
-//!             packet_type: PacketType::Media,
-//!             flags: Flags::default(),
-//!             stream_id: 1,
-//!             media_seq: seq,
-//!             transport_seq: seq,
-//!             frame_id: 1,
-//!             frag_index: 0,
-//!             frag_count: 1,
-//!             timestamp: 90_000,
-//!             ttl_ms: 100,
-//!         },
-//!         payload,
-//!     };
-//!     let mut buf = vec![0u8; pkt.encoded_len()];
-//!     pkt.encode(&mut buf);
-//!     Bytes::from(buf)
+//! fn media_wire(seq: u32, payload: &[u8]) -> Bytes {
+//!     Packet {
+//!         sequence: seq,
+//!         timestamp: 90_000,
+//!         payload: Payload::Stream(Stream {
+//!             id: 1,
+//!             idx: 1,
+//!             packet: StreamPacket::Media(MediaFragmentPacket {
+//!                 sequence: seq,
+//!                 id: 1,
+//!                 fragment_idx: 0,
+//!                 fragment_count: 1,
+//!                 media_type: MediaType::Video,
+//!                 is_key_frame: false,
+//!                 payload: Bytes::copy_from_slice(payload),
+//!             }),
+//!         }),
+//!     }
+//!     .into_bytes()
 //! }
 //!
 //! let w0 = media_wire(10, b"aaa");
@@ -92,7 +83,6 @@
 //! assert_eq!(recovered.len(), 1);
 //! assert_eq!(recovered[0].media_seq, 11);
 //! assert_eq!(recovered[0].wire, w1);
-//! let _ = HEADER_SIZE;
 //! ```
 //!
 //! # Notes
@@ -105,9 +95,7 @@ use std::collections::VecDeque;
 use ahash::{HashMap, HashMapExt};
 use bytes::Bytes;
 
-use crate::core::packet::{
-    DecodeError, FEC_BODY_HEADER_SIZE, Flags, HEADER_SIZE, Header, Packet, PacketType,
-};
+use crate::core::packet::{Packet, PacketError, Payload, StreamPacket};
 
 /// Maximum media packets in one FEC protection block (WebRTC `kUlpfecMaxMediaPackets`).
 pub const MAX_MEDIA_PACKETS: usize = 48;
@@ -166,9 +154,9 @@ pub fn num_fec_packets(num_media: usize, fec_rate: u8) -> usize {
 /// Error from FEC encode / receive helpers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FecError {
-    /// Wire bytes are not a decodable [`Packet::Media`].
+    /// Wire bytes are not a decodable media packet.
     NotMedia,
-    /// [`Header::stream_id`] does not match the generator / expected stream.
+    /// Stream id does not match the generator / expected stream.
     StreamMismatch {
         /// Stream id carried by the packet.
         got: u8,
@@ -180,19 +168,19 @@ pub enum FecError {
     /// Media sequences in the block cannot fit in a 48-bit mask window.
     SeqOutOfWindow {
         /// Candidate window base that failed (often the lowest tried seq).
-        seq_base: u16,
+        seq_base: u32,
         /// Offending sequence.
-        media_seq: u16,
+        media_seq: u32,
     },
     /// `media_seq` argument does not match the decoded Media header.
     SeqMismatch {
         /// Sequence passed to [`FecGenerator::push`].
-        arg: u16,
+        arg: u32,
         /// Sequence in the Media header.
-        header: u16,
+        header: u32,
     },
     /// Underlying packet decode failure.
-    Decode(DecodeError),
+    Decode(PacketError),
 }
 
 impl std::fmt::Display for FecError {
@@ -229,22 +217,21 @@ impl std::error::Error for FecError {
     }
 }
 
-impl From<DecodeError> for FecError {
-    fn from(value: DecodeError) -> Self {
+impl From<PacketError> for FecError {
+    fn from(value: PacketError) -> Self {
         Self::Decode(value)
     }
 }
 
-/// Owned FEC parity packet ready to encode onto the wire.
+/// Owned FEC parity row.
 ///
-/// [`Header::transport_seq`] is left at `0` until the pacer / host assigns a
-/// connection-wide transport sequence at send time.
+/// This is not a [`crate::core::packet::Packet`]. Callers decide how to send it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FecPacketOwned {
-    /// Common header (`packet_type == Fec`, `retrans == false`).
-    pub header: Header,
+    /// Stream whose media datagrams this row protects.
+    pub stream_id: u8,
     /// First media sequence covered by [`Self::mask`].
-    pub seq_base: u16,
+    pub seq_base: u32,
     /// Bit `i` set ⇒protects `seq_base.wrapping_add(i)`.
     pub mask: u64,
     /// XOR of protected Media datagram lengths (`u16`).
@@ -253,72 +240,13 @@ pub struct FecPacketOwned {
     pub payload: Bytes,
 }
 
-impl FecPacketOwned {
-    /// Borrow as a [`Packet::Fec`] view.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use bytes::Bytes;
-    /// use qrt::core::{
-    ///     fec::{FecGenerator, FecProtectionParams},
-    ///     packet::{Flags, Header, Packet, PacketType},
-    /// };
-    ///
-    /// let pkt = Packet::Media {
-    ///     header: Header {
-    ///         packet_type: PacketType::Media,
-    ///         flags: Flags::default(),
-    ///         stream_id: 0,
-    ///         media_seq: 1,
-    ///         transport_seq: 1,
-    ///         frame_id: 0,
-    ///         frag_index: 0,
-    ///         frag_count: 1,
-    ///         timestamp: 0,
-    ///         ttl_ms: 50,
-    ///     },
-    ///     payload: b"x",
-    /// };
-    /// let mut wire = vec![0u8; pkt.encoded_len()];
-    /// pkt.encode(&mut wire);
-    /// let mut fec_gen = FecGenerator::new(0, FecProtectionParams { fec_rate: 255 });
-    /// fec_gen.push(1, Bytes::from(wire)).unwrap();
-    /// let fec = &fec_gen.flush()[0];
-    /// assert!(matches!(fec.as_packet(), Packet::Fec { .. }));
-    /// ```
-    pub fn as_packet(&self) -> Packet<'_> {
-        Packet::Fec {
-            header: self.header.clone(),
-            seq_base: self.seq_base,
-            mask: self.mask,
-            length_xor: self.length_xor,
-            payload: &self.payload,
-        }
-    }
-
-    /// Encode into a newly allocated datagram buffer.
-    pub fn to_wire(&self) -> Bytes {
-        let pkt = self.as_packet();
-        let mut buf = vec![0u8; pkt.encoded_len()];
-        pkt.encode(&mut buf);
-
-        Bytes::from(buf)
-    }
-
-    /// Encoded length of the full FEC datagram.
-    pub fn encoded_len(&self) -> usize {
-        HEADER_SIZE + FEC_BODY_HEADER_SIZE + self.payload.len()
-    }
-}
-
 /// Media datagram recovered by XOR.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveredPacket {
     /// Media stream id from the recovered header.
     pub stream_id: u8,
-    /// [`Header::media_seq`] of the recovered Media packet.
-    pub media_seq: u16,
+    /// Media sequence of the recovered media packet.
+    pub media_seq: u32,
     /// Full Media datagram (header + body), ready for reassembly / decode.
     pub wire: Bytes,
 }
@@ -333,11 +261,11 @@ pub struct FecGenerator {
     stream_id: u8,
     params: FecProtectionParams,
     /// Pending media: `(media_seq, full wire)`.
-    pending: Vec<(u16, Bytes)>,
+    pending: Vec<(u32, Bytes)>,
 }
 
 impl FecGenerator {
-    /// Creates a generator for one media [`Header::stream_id`].
+    /// Creates a generator for one media stream id.
     ///
     /// # Examples
     ///
@@ -378,7 +306,7 @@ impl FecGenerator {
 
     /// Adds one full Media datagram to the protection window.
     ///
-    /// `wire` must be an encoded [`Packet::Media`] for [`Self::stream_id`].
+    /// `wire` must be an encoded media [`crate::core::packet::Packet`] for [`Self::stream_id`].
     /// Sequences should stay within a 48-wide window from the first packet in
     /// the block (`seq_base`).
     ///
@@ -394,7 +322,7 @@ impl FecGenerator {
     /// # Examples
     ///
     /// See the [module-level example](crate::core::fec).
-    pub fn push(&mut self, media_seq: u16, wire: Bytes) -> Result<Vec<FecPacketOwned>, FecError> {
+    pub fn push(&mut self, media_seq: u32, wire: Bytes) -> Result<Vec<FecPacketOwned>, FecError> {
         self.validate_media(media_seq, &wire)?;
 
         let mut produced = Vec::new();
@@ -402,7 +330,7 @@ impl FecGenerator {
             produced = self.flush();
         }
 
-        let mut seqs: Vec<u16> = self.pending.iter().map(|(s, _)| *s).collect();
+        let mut seqs: Vec<u32> = self.pending.iter().map(|(s, _)| *s).collect();
         seqs.push(media_seq);
         if window_base(&seqs).is_none() {
             let seq_base = seqs.iter().copied().min().unwrap_or(media_seq);
@@ -433,34 +361,34 @@ impl FecGenerator {
     /// use bytes::Bytes;
     /// use qrt::core::{
     ///     fec::{FecGenerator, FecProtectionParams, FecReceiver},
-    ///     packet::{Flags, Header, Packet, PacketType},
+    ///     packet::{MediaFragmentPacket, MediaType, Packet, Payload, Stream, StreamPacket},
     /// };
     ///
-    /// fn media_wire(seq: u16, payload: &[u8]) -> Bytes {
-    ///     let pkt = Packet::Media {
-    ///         header: Header {
-    ///             packet_type: PacketType::Media,
-    ///             flags: Flags::default(),
-    ///             stream_id: 0,
-    ///             media_seq: seq,
-    ///             transport_seq: seq,
-    ///             frame_id: 1,
-    ///             frag_index: 0,
-    ///             frag_count: 1,
-    ///             timestamp: 1,
-    ///             ttl_ms: 80,
-    ///         },
-    ///         payload,
-    ///     };
-    ///     let mut buf = vec![0u8; pkt.encoded_len()];
-    ///     pkt.encode(&mut buf);
-    ///     Bytes::from(buf)
+    /// fn media_wire(seq: u32, payload: &[u8]) -> Bytes {
+    ///     Packet {
+    ///         sequence: seq,
+    ///         timestamp: 1,
+    ///         payload: Payload::Stream(Stream {
+    ///             id: 0,
+    ///             idx: 1,
+    ///             packet: StreamPacket::Media(MediaFragmentPacket {
+    ///                 sequence: seq,
+    ///                 id: 1,
+    ///                 fragment_idx: 0,
+    ///                 fragment_count: 1,
+    ///                 media_type: MediaType::Video,
+    ///                 is_key_frame: false,
+    ///                 payload: Bytes::copy_from_slice(payload),
+    ///             }),
+    ///         }),
+    ///     }
+    ///     .into_bytes()
     /// }
     ///
-    /// let wires: Vec<_> = (0..4u16).map(|s| media_wire(s, &[s as u8; 4])).collect();
+    /// let wires: Vec<_> = (0..4u32).map(|s| media_wire(s, &[s as u8; 4])).collect();
     /// let mut fec_gen = FecGenerator::new(0, FecProtectionParams { fec_rate: 128 });
     /// for (s, w) in wires.iter().enumerate() {
-    ///     assert!(fec_gen.push(s as u16, w.clone()).unwrap().is_empty());
+    ///     assert!(fec_gen.push(s as u32, w.clone()).unwrap().is_empty());
     /// }
     /// // rate 128 → num_fec = (4*128+128)/256 = 2
     /// let rows = fec_gen.flush();
@@ -488,27 +416,15 @@ impl FecGenerator {
             return Vec::new();
         }
 
-        let seqs: Vec<u16> = media.iter().map(|(s, _)| *s).collect();
+        let seqs: Vec<u32> = media.iter().map(|(s, _)| *s).collect();
         let seq_base = window_base(&seqs).unwrap_or(0);
         // Map media_seq →index in mask (relative to seq_base).
         let mut by_bit: [Option<&Bytes>; MAX_MEDIA_PACKETS] = [None; MAX_MEDIA_PACKETS];
-        let mut meta_ts = 0u32;
-        let mut meta_ttl = u16::MAX;
-        let mut any_key = false;
-        let mut any_audio = false;
-        let mut last_frame_id = 0u32;
 
         for (seq, wire) in &media {
-            let bit = usize::from(seq.wrapping_sub(seq_base));
+            let bit = usize::try_from(seq.wrapping_sub(seq_base)).unwrap_or(MAX_MEDIA_PACKETS);
             debug_assert!(bit < MAX_MEDIA_PACKETS);
             by_bit[bit] = Some(wire);
-            if let Ok(Packet::Media { header, .. }) = Packet::decode(wire) {
-                meta_ts = meta_ts.max(header.timestamp);
-                meta_ttl = meta_ttl.min(header.ttl_ms);
-                any_key |= header.flags.key;
-                any_audio |= header.flags.audio;
-                last_frame_id = header.frame_id;
-            }
         }
 
         let present_bits: Vec<usize> = (0..MAX_MEDIA_PACKETS)
@@ -543,22 +459,7 @@ impl FecGenerator {
             }
 
             rows.push(FecPacketOwned {
-                header: Header {
-                    packet_type: PacketType::Fec,
-                    flags: Flags {
-                        retrans: false,
-                        audio: any_audio,
-                        key: any_key,
-                    },
-                    stream_id: self.stream_id,
-                    media_seq: 0,
-                    transport_seq: 0,
-                    frame_id: last_frame_id,
-                    frag_index: 0,
-                    frag_count: 1,
-                    timestamp: meta_ts,
-                    ttl_ms: if meta_ttl == u16::MAX { 0 } else { meta_ttl },
-                },
+                stream_id: self.stream_id,
                 seq_base,
                 mask,
                 length_xor,
@@ -569,42 +470,44 @@ impl FecGenerator {
         rows
     }
 
-    fn validate_media(&self, media_seq: u16, wire: &[u8]) -> Result<(), FecError> {
-        match Packet::decode(wire)? {
-            Packet::Media { header, .. } => {
-                if header.stream_id != self.stream_id {
-                    return Err(FecError::StreamMismatch {
-                        got: header.stream_id,
-                        expected: self.stream_id,
-                    });
-                }
-                if header.media_seq != media_seq {
-                    return Err(FecError::SeqMismatch {
-                        arg: media_seq,
-                        header: header.media_seq,
-                    });
-                }
-                Ok(())
-            }
-            _ => Err(FecError::NotMedia),
+    fn validate_media(&self, media_seq: u32, wire: &[u8]) -> Result<(), FecError> {
+        let packet = Packet::from_bytes(Bytes::copy_from_slice(wire))?;
+        let Payload::Stream(stream) = packet.payload else {
+            return Err(FecError::NotMedia);
+        };
+        let StreamPacket::Media(media) = stream.packet else {
+            return Err(FecError::NotMedia);
+        };
+
+        if stream.id != self.stream_id {
+            return Err(FecError::StreamMismatch {
+                got: stream.id,
+                expected: self.stream_id,
+            });
         }
+
+        if media.sequence != media_seq {
+            return Err(FecError::SeqMismatch {
+                arg: media_seq,
+                header: media.sequence,
+            });
+        }
+
+        Ok(())
     }
 }
 
 /// Finds a `seq_base` such that every seq is in `[base, base+48)` (wrapping).
-fn window_base(seqs: &[u16]) -> Option<u16> {
+fn window_base(seqs: &[u32]) -> Option<u32> {
     if seqs.is_empty() {
         return Some(0);
     }
-    for &base in seqs {
-        if seqs
-            .iter()
-            .all(|&s| s.wrapping_sub(base) < MAX_MEDIA_PACKETS as u16)
-        {
-            return Some(base);
-        }
-    }
-    None
+    seqs.iter()
+        .find(|&&base| {
+            seqs.iter()
+                .all(|&seq| seq.wrapping_sub(base) < MAX_MEDIA_PACKETS as u32)
+        })
+        .copied()
 }
 
 /// Receive-side store of recent Media + FEC for single-loss recovery.
@@ -616,7 +519,7 @@ fn window_base(seqs: &[u16]) -> Option<u16> {
 #[derive(Debug, Clone)]
 pub struct FecReceiver {
     /// `(stream_id, media_seq)` →full Media wire.
-    media: HashMap<(u8, u16), Bytes>,
+    media: HashMap<(u8, u32), Bytes>,
     /// Recent FEC rows (oldest first); bounded with media capacity.
     fec: VecDeque<StoredFec>,
     capacity: usize,
@@ -625,7 +528,7 @@ pub struct FecReceiver {
 #[derive(Debug, Clone)]
 struct StoredFec {
     stream_id: u8,
-    seq_base: u16,
+    seq_base: u32,
     mask: u64,
     length_xor: u16,
     payload: Bytes,
@@ -662,7 +565,7 @@ impl FecReceiver {
     }
 
     /// Returns whether this media sequence is already known (received or recovered).
-    pub fn has_media(&self, stream_id: u8, media_seq: u16) -> bool {
+    pub fn has_media(&self, stream_id: u8, media_seq: u32) -> bool {
         self.media.contains_key(&(stream_id, media_seq))
     }
 
@@ -677,7 +580,7 @@ impl FecReceiver {
     pub fn insert_media(
         &mut self,
         stream_id: u8,
-        media_seq: u16,
+        media_seq: u32,
         wire: Bytes,
     ) -> Vec<RecoveredPacket> {
         let key = (stream_id, media_seq);
@@ -693,7 +596,7 @@ impl FecReceiver {
     /// Inserts a FEC row from an owned packet and tries recovery.
     pub fn insert_fec_owned(&mut self, fec: &FecPacketOwned) -> Vec<RecoveredPacket> {
         self.insert_fec(
-            fec.header.stream_id,
+            fec.stream_id,
             fec.seq_base,
             fec.mask,
             fec.length_xor,
@@ -701,39 +604,11 @@ impl FecReceiver {
         )
     }
 
-    /// Inserts a decoded [`Packet::Fec`] (copies the XOR payload).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FecError::NotMedia`] is not used here; pass only FEC packets.
-    /// Invalid types should be filtered by the demuxer before calling.
-    pub fn insert_fec_packet(
-        &mut self,
-        packet: &Packet<'_>,
-    ) -> Result<Vec<RecoveredPacket>, FecError> {
-        match packet {
-            Packet::Fec {
-                header,
-                seq_base,
-                mask,
-                length_xor,
-                payload,
-            } => Ok(self.insert_fec(
-                header.stream_id,
-                *seq_base,
-                *mask,
-                *length_xor,
-                Bytes::copy_from_slice(payload),
-            )),
-            _ => Err(FecError::NotMedia),
-        }
-    }
-
     /// Inserts raw FEC fields and tries recovery.
     pub fn insert_fec(
         &mut self,
         stream_id: u8,
-        seq_base: u16,
+        seq_base: u32,
         mask: u64,
         length_xor: u16,
         payload: Bytes,
@@ -763,8 +638,8 @@ impl FecReceiver {
                 let row = self.fec[i].clone();
                 if let Some(recovered) = try_recover_row(&row, &self.media) {
                     let key = (recovered.stream_id, recovered.media_seq);
-                    if !self.media.contains_key(&key) {
-                        self.media.insert(key, recovered.wire.clone());
+                    if let std::collections::hash_map::Entry::Vacant(slot) = self.media.entry(key) {
+                        slot.insert(recovered.wire.clone());
                         out.push(recovered);
                         progressed = true;
                     }
@@ -789,7 +664,7 @@ impl FecReceiver {
         }
 
         // Drop arbitrary oldest-ish half by clearing lowest seq keys first.
-        let mut keys: Vec<(u8, u16)> = self.media.keys().copied().collect();
+        let mut keys: Vec<(u8, u32)> = self.media.keys().copied().collect();
         keys.sort_by(|a, b| {
             a.0.cmp(&b.0).then_with(|| {
                 // wrapping-aware: keep higher seqs (recent) when same stream.
@@ -814,13 +689,13 @@ fn xor_bytes(dst: &mut [u8], src: &[u8]) {
     // Bytes past `src.len()` in `dst` stay as-is (zero pad of src).
 }
 
-fn try_recover_row(row: &StoredFec, media: &HashMap<(u8, u16), Bytes>) -> Option<RecoveredPacket> {
-    let mut missing_bit: Option<u16> = None;
+fn try_recover_row(row: &StoredFec, media: &HashMap<(u8, u32), Bytes>) -> Option<RecoveredPacket> {
+    let mut missing_bit: Option<u32> = None;
     let mut missing_count = 0u32;
     let mut length_acc = row.length_xor;
     let mut buf = row.payload.to_vec();
 
-    for bit in 0..MAX_MEDIA_PACKETS as u16 {
+    for bit in 0..MAX_MEDIA_PACKETS as u32 {
         if row.mask & (1u64 << bit) == 0 {
             continue;
         }
@@ -866,15 +741,23 @@ fn try_recover_row(row: &StoredFec, media: &HashMap<(u8, u16), Bytes>) -> Option
 
     // Sanity: recovered bytes must decode as Media with matching seq / stream.
     let media_seq = row.seq_base.wrapping_add(bit);
-    match Packet::decode(&buf) {
-        Ok(Packet::Media { header, .. })
-            if header.stream_id == row.stream_id && header.media_seq == media_seq =>
-        {
-            Some(RecoveredPacket {
-                stream_id: row.stream_id,
-                media_seq,
-                wire: Bytes::from(buf),
-            })
+    match Packet::from_bytes(Bytes::copy_from_slice(&buf)) {
+        Ok(packet) => {
+            let Payload::Stream(stream) = &packet.payload else {
+                return None;
+            };
+            let StreamPacket::Media(media) = &stream.packet else {
+                return None;
+            };
+            if stream.id == row.stream_id && media.sequence == media_seq {
+                Some(RecoveredPacket {
+                    stream_id: row.stream_id,
+                    media_seq,
+                    wire: Bytes::from(buf),
+                })
+            } else {
+                None
+            }
         }
         _ => None,
     }

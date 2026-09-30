@@ -9,10 +9,22 @@ license = "GPL-3.0-only"
 ahash = "0.8.12"
 bytes = "1.12.1"
 parking_lot = "0.12.5"
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
 tokio = { version = "1.53.1", features = [
+    "io-util",
     "net",
     "time",
     "sync",
     "macros",
     "rt",
+    "rt-multi-thread",
 ] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+tracing = "0.1"
+
+[dev-dependencies]
+anyhow = "1"
+rcgen = "0.13"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

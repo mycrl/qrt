@@ -18,8 +18,9 @@
 //! 1. On each matched arrival feedback → [`BandwidthEstimator::on_feedback`].
 //! 2. On a ~25–100 ms timer → [`BandwidthEstimator::poll_probes`]; run clusters
 //!    on the pacer, then [`BandwidthEstimator::on_probe_result`].
-//! 3. Apply [`RateUpdate::pacing_rate_bps`] to the pacer and notify the
-//!    encoder via [`crate::codec::Encoder::on_rate_params`] (apps should not
+//! 3. Apply [`RateUpdate::pacing_rate_bps`] to the pacer and emit
+//!    [`crate::codec::CodecEvent::Rate`] (via the session) so [`crate::Qrt`] can
+//!    call [`crate::codec::Encoder::on_rate_params`] (apps should not
 //!    consume probe clusters themselves).
 //! 4. Optionally pass the encoder target through [`send_side_pushback`] when
 //!    the send queue or in-flight window is overloaded.
@@ -63,7 +64,7 @@
 //! let lossy = TransportPacketsFeedback {
 //!     feedback_time: t0 + Duration::from_millis(100),
 //!     data_in_flight: 0,
-//!     packets: (0..10u16)
+//!     packets: (0..10u32)
 //!         .map(|i| PacketResult {
 //!             transport_seq: i,
 //!             send_time: t0 + Duration::from_millis(u64::from(i) * 5),
@@ -713,10 +714,10 @@ pub fn send_side_pushback(
         rate = rate * 9 / 10;
     }
 
-    if let Some(cwnd) = congestion_window_bytes {
-        if in_flight_bytes > cwnd {
-            rate = rate / 2;
-        }
+    if let Some(cwnd) = congestion_window_bytes
+        && in_flight_bytes > cwnd
+    {
+        rate /= 2;
     }
 
     rate.max(1)

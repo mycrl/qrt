@@ -39,9 +39,10 @@
 //! ```
 //! use std::time::{Duration, Instant};
 //!
+//! use bytes::Bytes;
 //! use qrt::core::{
 //!     pacer::{Pacer, PacerConfig},
-//!     packet::{Flags, Header, Packet, PacketType},
+//!     packet::{MediaFragmentPacket, MediaType, Packet, Payload, Stream, StreamPacket},
 //! };
 //!
 //! let mut pacer = Pacer::new(PacerConfig {
@@ -50,26 +51,28 @@
 //! });
 //!
 //! let now = Instant::now();
-//! let pkt = Packet::Media {
-//!     header: Header {
-//!         packet_type: PacketType::Media,
-//!         flags: Flags::default(),
-//!         stream_id: 0,
-//!         media_seq: 0,
-//!         transport_seq: 0,
-//!         frame_id: 0,
-//!         frag_index: 0,
-//!         frag_count: 1,
-//!         timestamp: 0,
-//!         ttl_ms: 200,
-//!     },
-//!     payload: &[0u8; 500],
+//! let pkt = Packet {
+//!     sequence: 0,
+//!     timestamp: 0,
+//!     payload: Payload::Stream(Stream {
+//!         id: 0,
+//!         idx: 0,
+//!         packet: StreamPacket::Media(MediaFragmentPacket {
+//!             sequence: 0,
+//!             id: 0,
+//!             fragment_idx: 0,
+//!             fragment_count: 1,
+//!             media_type: MediaType::Video,
+//!             is_key_frame: false,
+//!             payload: Bytes::from(vec![0u8; 500]),
+//!         }),
+//!     }),
 //! };
-//! assert!(pacer.enqueue_packet(&pkt, now));
+//! assert!(pacer.enqueue_packet(&pkt, 200, now));
 //! assert!(pacer.poll(now).is_some());
 //!
 //! // Debt now exceeds the 40ms burst budget; wait before the next send.
-//! assert!(pacer.enqueue_packet(&pkt, now));
+//! assert!(pacer.enqueue_packet(&pkt, 200, now));
 //! assert!(pacer.poll(now).is_none());
 //! let wake = pacer.next_send_time(now).unwrap();
 //! assert!(wake > now);
@@ -80,7 +83,7 @@
 //!
 //! - Padding / probe cluster *generation* is a BWE concern; this type only
 //!   rate-limits whatever you enqueue (including future padding packets).
-//! - Assign [`crate::core::packet::Header::transport_seq`] at true send time (pacer egress or
+//! - Assign [`crate::core::packet::Packet::sequence`] at true send time (pacer egress or
 //!   socket write), not only at fragment time — see `docs/webrtc-reference.md` §15.
 
 use std::time::{Duration, Instant};
@@ -168,8 +171,8 @@ impl Pacer {
     }
 
     /// Enqueue an encoded packet; returns `false` if dropped for zero TTL.
-    pub fn enqueue_packet(&mut self, packet: &Packet<'_>, now: Instant) -> bool {
-        self.queue.enqueue_packet(packet, now)
+    pub fn enqueue_packet(&mut self, packet: &Packet, ttl_ms: u16, now: Instant) -> bool {
+        self.queue.enqueue_packet(packet, ttl_ms, now)
     }
 
     /// Enqueue a pre-built outgoing datagram.
@@ -184,10 +187,10 @@ impl Pacer {
     pub fn poll(&mut self, now: Instant) -> Option<OutgoingPacket> {
         self.advance_time(now);
 
-        if !self.config.account_for_audio {
-            if let Some(Priority::Audio) = self.queue.peek_priority() {
-                return self.queue.pop(now);
-            }
+        if !self.config.account_for_audio
+            && let Some(Priority::Audio) = self.queue.peek_priority()
+        {
+            return self.queue.pop(now);
         }
 
         if !self.can_send_paced() {
@@ -212,10 +215,10 @@ impl Pacer {
             return None;
         }
 
-        if !self.config.account_for_audio {
-            if let Some(Priority::Audio) = self.queue.peek_priority() {
-                return Some(now);
-            }
+        if !self.config.account_for_audio
+            && let Some(Priority::Audio) = self.queue.peek_priority()
+        {
+            return Some(now);
         }
 
         if self.can_send_paced() {

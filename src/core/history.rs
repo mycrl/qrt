@@ -1,8 +1,9 @@
 //! Send-side retransmission history.
 //!
 //! Stores Media datagrams **after** they have been paced onto the wire so a
-//! later [`crate::core::packet::Packet::Nack`] can clone them with
-//! [`Flags::retrans`] set. Aligns with WebRTC `RtpPacketHistory` /
+//! later [`crate::core::packet::NackPacket`] can clone them. A retransmission
+//! keeps the media sequence and clears [`crate::core::packet::Packet::sequence`]
+//! so the pacer assigns a new one. Aligns with WebRTC `RtpPacketHistory` /
 //! `RTPSender::ReSendPacket` (`modules/rtp_rtcp/source/rtp_packet_history.*`),
 //! adapted to qrt's TTL deadline and same-`media_seq` retransmit (no RTX SSRC).
 //!
@@ -22,46 +23,46 @@
 //! use bytes::Bytes;
 //! use qrt::core::{
 //!     history::{PacketHistory, RetransmitOutcome},
-//!     packet::{Flags, Header, Packet, PacketType},
+//!     packet::{MediaFragmentPacket, MediaType, Packet, Payload, Stream, StreamPacket},
 //! };
 //!
-//! fn media_wire(seq: u16, ttl_ms: u16) -> Bytes {
-//!     let pkt = Packet::Media {
-//!         header: Header {
-//!             packet_type: PacketType::Media,
-//!             flags: Flags::default(),
-//!             stream_id: 1,
-//!             media_seq: seq,
-//!             transport_seq: seq,
-//!             frame_id: 1,
-//!             frag_index: 0,
-//!             frag_count: 1,
-//!             timestamp: 0,
-//!             ttl_ms,
-//!         },
-//!         payload: b"x",
-//!     };
-//!     let mut buf = vec![0u8; pkt.encoded_len()];
-//!     pkt.encode(&mut buf);
-//!     Bytes::from(buf)
+//! fn media_wire(seq: u32) -> Bytes {
+//!     Packet {
+//!         sequence: seq,
+//!         timestamp: 0,
+//!         payload: Payload::Stream(Stream {
+//!             id: 1,
+//!             idx: 1,
+//!             packet: StreamPacket::Media(MediaFragmentPacket {
+//!                 sequence: seq,
+//!                 id: 1,
+//!                 fragment_idx: 0,
+//!                 fragment_count: 1,
+//!                 media_type: MediaType::Video,
+//!                 is_key_frame: false,
+//!                 payload: Bytes::from_static(b"x"),
+//!             }),
+//!         }),
+//!     }
+//!     .into_bytes()
 //! }
 //!
 //! let t0 = Instant::now();
 //! let mut hist = PacketHistory::new(64);
 //! hist.set_rtt(Duration::from_millis(40));
-//! hist.put(
-//!     1,
-//!     10,
-//!     media_wire(10, 200),
-//!     t0,
-//!     t0 + Duration::from_millis(200),
-//! );
+//! hist.put(1, 10, media_wire(10), t0, t0 + Duration::from_millis(200));
 //!
 //! match hist.get_retransmission(1, 10, t0 + Duration::from_millis(50)) {
 //!     RetransmitOutcome::Ready(out) => {
-//!         let h = Header::decode(&out.wire).unwrap();
-//!         assert!(h.flags.retrans);
-//!         assert_eq!(h.media_seq, 10);
+//!         let decoded = Packet::from_bytes(out.wire).unwrap();
+//!         assert_eq!(decoded.sequence, 0);
+//!         match decoded.payload {
+//!             Payload::Stream(stream) => match stream.packet {
+//!                 StreamPacket::Media(media) => assert_eq!(media.sequence, 10),
+//!                 _ => panic!("expected media"),
+//!             },
+//!             _ => panic!("expected media"),
+//!         }
 //!         hist.mark_sent(1, 10, t0 + Duration::from_millis(50));
 //!     }
 //!     other => panic!("expected Ready, got {other:?}"),
@@ -76,7 +77,7 @@
 //!
 //! # Notes
 //!
-//! - Key is `(stream_id, media_seq)`; [`Header::transport_seq`] on retransmit
+//! - Key is `(stream_id, media_seq)`. [`Packet::sequence`] on retransmit
 //!   is cleared to `0` so the pacer can assign a fresh transport sequence.
 //! - Expired entries (`now >= deadline`) are never retransmitted.
 //! - Optional [`RetransRateLimiter`] caps RTX bytes over a sliding window
@@ -91,7 +92,7 @@ use ahash::{HashMap, HashMapExt};
 use bytes::Bytes;
 
 use crate::core::{
-    packet::{HEADER_SIZE, Header, Packet, PacketType},
+    packet::{MediaType, Packet, Payload, StreamPacket},
     send_queue::{OutgoingPacket, Priority},
 };
 
@@ -129,8 +130,8 @@ struct HistoryEntry {
 #[derive(Debug, Clone)]
 pub struct PacketHistory {
     capacity: usize,
-    entries: HashMap<(u8, u16), HistoryEntry>,
-    order: VecDeque<(u8, u16)>,
+    entries: HashMap<(u8, u32), HistoryEntry>,
+    order: VecDeque<(u8, u32)>,
     rtt: Duration,
     limiter: Option<RetransRateLimiter>,
 }
@@ -195,31 +196,28 @@ impl PacketHistory {
     pub fn put(
         &mut self,
         stream_id: u8,
-        media_seq: u16,
+        media_seq: u32,
         wire: Bytes,
         now: Instant,
         deadline: Instant,
     ) {
-        if Packet::decode(&wire)
+        if Packet::from_bytes(wire.clone())
             .ok()
-            .is_none_or(|p| !matches!(p, Packet::Media { .. }))
+            .is_none_or(|packet| !is_media(&packet))
         {
             return;
         }
 
         let key = (stream_id, media_seq);
-        if self.entries.contains_key(&key) {
+        if let std::collections::hash_map::Entry::Occupied(mut slot) = self.entries.entry(key) {
             // Refresh in place; keep order position.
-            self.entries.insert(
-                key,
-                HistoryEntry {
-                    wire,
-                    deadline,
-                    last_sent_at: now,
-                    pending: false,
-                    retransmit_count: 0,
-                },
-            );
+            slot.insert(HistoryEntry {
+                wire,
+                deadline,
+                last_sent_at: now,
+                pending: false,
+                retransmit_count: 0,
+            });
 
             return;
         }
@@ -251,17 +249,21 @@ impl PacketHistory {
     /// Ignores non-Media and already-retransmitted wires (those only
     /// [`Self::mark_sent`]).
     pub fn put_outgoing(&mut self, packet: &OutgoingPacket, now: Instant) {
-        let Ok(header) = Header::decode(&packet.wire) else {
-            return;
-        };
-
-        if header.packet_type != PacketType::Media || header.flags.retrans {
+        if packet.retransmit {
             return;
         }
 
+        let Ok(decoded) = Packet::from_bytes(packet.wire.clone()) else {
+            return;
+        };
+
+        let Some((stream_id, media_seq)) = media_key(&decoded) else {
+            return;
+        };
+
         self.put(
-            header.stream_id,
-            header.media_seq,
+            stream_id,
+            media_seq,
             packet.wire.clone(),
             now,
             packet.deadline,
@@ -269,7 +271,7 @@ impl PacketHistory {
     }
 
     /// Looks up `media_seq` and, if eligible, builds a retransmission
-    /// [`OutgoingPacket`] with `flags.retrans = true`.
+    /// [`OutgoingPacket`] with [`OutgoingPacket::retransmit`] set.
     ///
     /// On [`RetransmitOutcome::Ready`], the entry is marked `pending` until
     /// [`Self::mark_sent`] (or a later failed path clears it — host should
@@ -278,7 +280,7 @@ impl PacketHistory {
     pub fn get_retransmission(
         &mut self,
         stream_id: u8,
-        media_seq: u16,
+        media_seq: u32,
         now: Instant,
     ) -> RetransmitOutcome {
         let key = (stream_id, media_seq);
@@ -304,21 +306,27 @@ impl PacketHistory {
             return RetransmitOutcome::Expired;
         }
 
-        let wire = match with_retrans_flag(&entry.wire, ttl_ms) {
+        let wire = match prepare_retransmit(&entry.wire) {
             Some(w) => w,
             None => return RetransmitOutcome::NotFound,
         };
 
-        if let Some(limiter) = self.limiter.as_mut() {
-            if !limiter.try_consume(wire.len() as u64, now) {
-                return RetransmitOutcome::RateLimited;
-            }
+        let priority = match Packet::from_bytes(wire.clone()).ok().as_ref() {
+            Some(packet) if is_audio(packet) => Priority::Audio,
+            _ => Priority::Retransmission,
+        };
+
+        if let Some(limiter) = self.limiter.as_mut()
+            && !limiter.try_consume(wire.len() as u64, now)
+        {
+            return RetransmitOutcome::RateLimited;
         }
 
         let out = OutgoingPacket {
             wire,
-            priority: Priority::Retransmission,
+            priority,
             stream_id,
+            retransmit: true,
             enqueued_at: now,
             deadline: entry.deadline,
         };
@@ -331,7 +339,7 @@ impl PacketHistory {
 
     /// Clears `pending` and records that a retransmission (or first send refresh)
     /// left the pacer at `now`.
-    pub fn mark_sent(&mut self, stream_id: u8, media_seq: u16, now: Instant) {
+    pub fn mark_sent(&mut self, stream_id: u8, media_seq: u32, now: Instant) {
         if let Some(entry) = self.entries.get_mut(&(stream_id, media_seq)) {
             entry.pending = false;
             entry.last_sent_at = now;
@@ -340,7 +348,7 @@ impl PacketHistory {
     }
 
     /// Clears `pending` without updating last-send time (enqueue abandoned).
-    pub fn clear_pending(&mut self, stream_id: u8, media_seq: u16) {
+    pub fn clear_pending(&mut self, stream_id: u8, media_seq: u32) {
         if let Some(entry) = self.entries.get_mut(&(stream_id, media_seq)) {
             entry.pending = false;
         }
@@ -457,23 +465,45 @@ impl RetransRateLimiter {
     }
 }
 
-/// Copy `wire`, set `flags.retrans`, clear `transport_seq`, refresh `ttl_ms`.
-fn with_retrans_flag(wire: &[u8], ttl_ms: u16) -> Option<Bytes> {
-    let mut header = Header::decode(wire).ok()?;
-    if header.packet_type != PacketType::Media {
+/// Copy `wire` and clear the transport sequence so the pacer stamps a new one.
+fn prepare_retransmit(wire: &[u8]) -> Option<Bytes> {
+    let mut packet = Packet::from_bytes(Bytes::copy_from_slice(wire)).ok()?;
+    if !is_media(&packet) {
         return None;
     }
 
-    header.flags.retrans = true;
-    header.transport_seq = 0;
-    header.ttl_ms = ttl_ms;
+    packet.sequence = 0;
 
-    let mut out = wire.to_vec();
-    if out.len() < HEADER_SIZE {
+    Some(packet.into_bytes())
+}
+
+fn is_media(packet: &Packet) -> bool {
+    matches!(
+        &packet.payload,
+        Payload::Stream(stream) if matches!(stream.packet, StreamPacket::Media(_))
+    )
+}
+
+fn media_key(packet: &Packet) -> Option<(u8, u32)> {
+    let Payload::Stream(stream) = &packet.payload else {
         return None;
-    }
+    };
 
-    header.encode(&mut out);
+    let StreamPacket::Media(media) = &stream.packet else {
+        return None;
+    };
 
-    Some(Bytes::from(out))
+    Some((stream.id, media.sequence))
+}
+
+fn is_audio(packet: &Packet) -> bool {
+    let Payload::Stream(stream) = &packet.payload else {
+        return false;
+    };
+
+    let StreamPacket::Media(media) = &stream.packet else {
+        return false;
+    };
+
+    media.media_type == MediaType::Audio
 }
